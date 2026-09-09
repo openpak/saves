@@ -1,0 +1,48 @@
+# Local configuration and credentials
+.env
+.env.local
+*.key
+*.pem
+*.p12
+*.pfx
+*.der
+*.crt
+*.cer
+
+# Captures, dumps, logs, and local analysis
+*.pcap
+*.pcapng
+*.cap
+*.dmp
+*.dump
+*.core
+*.log
+captures/
+analysis-local/
+research-local/
+
+# Proprietary or extracted material (must remain outside the repository)
+firmware/
+keys/
+title-keys/
+extracted/
+game-files/
+romfs/
+exefs/
+*.nro
+*.nso
+*.nca
+*.xci
+*.nsp
+
+# Build/editor output
+bin/
+dist/
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+deploy/oci/.env
+deploy/oci/certs/
+shared-docs
