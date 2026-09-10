@@ -25,7 +25,8 @@ type Service struct {
 	Store         *store.Store
 	Local         blob.Backend
 	Allowance     int64  // bytes of Local per account
-	CredentialKey []byte // seals S3 settings
+	CredentialKey []byte // seals storage settings
+	Providers     blob.Providers
 	URLKey        []byte // signs blob URLs the allowance backend hands out
 	// UploadHost and DownloadHost are the console-facing names the signed blob URLs carry;
 	// the adapter forwards both here.
@@ -46,7 +47,7 @@ func (s *Service) BackendFor(ctx context.Context, account string) (string, blob.
 	if err != nil {
 		return "", nil, err
 	}
-	return blob.S3, b, nil
+	return st.Kind, b, nil
 }
 
 // BackendNamed opens the backend a stored version says it lives in.
@@ -62,11 +63,11 @@ func (s *Service) BackendNamed(ctx context.Context, account, name string) (blob.
 }
 
 func (s *Service) openSettings(st *store.Settings) (blob.Backend, error) {
-	cfg, err := blob.Open(s.CredentialKey, st.Config)
+	cfg, err := blob.OpenConfig(s.CredentialKey, st.Config)
 	if err != nil {
 		return nil, err
 	}
-	return blob.NewS3(cfg)
+	return blob.NewBackend(cfg, s.Providers)
 }
 
 // CheckAllowance refuses a write of wanted bytes to the allowance backend when it would not
@@ -149,7 +150,7 @@ func (s *Service) Move(account string) {
 				return
 			}
 		}
-		if err := s.Store.SetBackend(ctx, v.ID, blob.S3); err != nil {
+		if err := s.Store.SetBackend(ctx, v.ID, name); err != nil {
 			fail(err)
 			return
 		}

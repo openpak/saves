@@ -1,5 +1,6 @@
 // Package blob holds the bytes. A Backend is where one account's save parts live: OpenPak's
-// own directory for the allowance, or the account's S3-compatible bucket. The index (package
+// own directory for the allowance, or the storage the account connected: an S3-compatible
+// bucket, a WebDAV share, Google Drive or OneDrive. The index (package
 // store) never sees a byte; this package never sees a version.
 package blob
 
@@ -9,11 +10,8 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -225,49 +223,10 @@ func (s *s3) PresignGet(ctx context.Context, key string, ttl time.Duration) (str
 	return u.String(), nil
 }
 
-// Test proves a bucket works before its settings are saved: write a marker, read it back,
-// check it is not readable without credentials, delete it. The public check is a warning in
-// the returned string, not a failure: a public bucket is the player's choice to make.
-func Test(ctx context.Context, cfg S3Config) (warning string, err error) {
-	b, err := NewS3(cfg)
-	if err != nil {
-		return "", err
-	}
-	key := fmt.Sprintf("openpak-test-%d", time.Now().UnixNano())
-	body := []byte("openpak storage test")
-	if err := b.Put(ctx, key, strings.NewReader(string(body)), int64(len(body))); err != nil {
-		return "", fmt.Errorf("write: %w", err)
-	}
-	defer b.Delete(ctx, key)
-	rc, _, err := b.Get(ctx, key)
-	if err != nil {
-		return "", fmt.Errorf("read back: %w", err)
-	}
-	got, _ := io.ReadAll(rc)
-	rc.Close()
-	if string(got) != string(body) {
-		return "", errors.New("read back a different object")
-	}
-	if u, err := b.(Presigner).PresignGet(ctx, key, time.Minute); err != nil {
-		return "", fmt.Errorf("presign: %w", err)
-	} else if anon, err := url.Parse(u); err == nil {
-		anon.RawQuery = ""
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, anon.String(), nil)
-		if resp, err := http.DefaultClient.Do(req); err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				warning = "this bucket is readable without credentials: anyone with a link can download your saves"
-			}
-		}
-	}
-	return warning, nil
-}
-
 // ---- sealed settings ----
 
-// Seal and Open protect a stored S3Config with AES-256-GCM under the deployment's key.
-func Seal(key []byte, cfg S3Config) ([]byte, error) {
-	pt, _ := json.Marshal(cfg)
+// sealBytes and openBytes protect a settings blob with AES-256-GCM under the deployment's key.
+func sealBytes(key, pt []byte) ([]byte, error) {
 	gcm, err := gcmOf(key)
 	if err != nil {
 		return nil, err
@@ -279,20 +238,15 @@ func Seal(key []byte, cfg S3Config) ([]byte, error) {
 	return append(nonce, gcm.Seal(nil, nonce, pt, nil)...), nil
 }
 
-func Open(key, sealed []byte) (S3Config, error) {
-	var cfg S3Config
+func openBytes(key, sealed []byte) ([]byte, error) {
 	gcm, err := gcmOf(key)
 	if err != nil {
-		return cfg, err
+		return nil, err
 	}
 	if len(sealed) < gcm.NonceSize() {
-		return cfg, errors.New("sealed config too short")
+		return nil, errors.New("sealed config too short")
 	}
-	pt, err := gcm.Open(nil, sealed[:gcm.NonceSize()], sealed[gcm.NonceSize():], nil)
-	if err != nil {
-		return cfg, err
-	}
-	return cfg, json.Unmarshal(pt, &cfg)
+	return gcm.Open(nil, sealed[:gcm.NonceSize()], sealed[gcm.NonceSize():], nil)
 }
 
 func gcmOf(key []byte) (cipher.AEAD, error) {

@@ -10,6 +10,8 @@
 //	SAVES_UPLOAD_HOST      console-facing blob hosts the adapter forwards here
 //	SAVES_DOWNLOAD_HOST      (defaults: scsi-upload.lp1.scsi.srv.nintendo.net, scsi-download.lp1.scsi.srv.nintendo.net)
 //	SAVES_SWITCH_TITLES    comma-separated title ids whose Switch policy is ALL_OK; empty allows every title
+//	SAVES_GOOGLE_CLIENT_ID / SAVES_GOOGLE_CLIENT_SECRET       Google Drive; unset = not offered
+//	SAVES_MICROSOFT_CLIENT_ID / SAVES_MICROSOFT_CLIENT_SECRET OneDrive; unset = not offered
 package main
 
 import (
@@ -62,8 +64,12 @@ func main() {
 		Store: st, Local: local, Allowance: allowance,
 		CredentialKey: []byte(credKey),
 		URLKey:        []byte(required("SAVES_INTERNAL_KEY")),
-		UploadHost:    env("SAVES_UPLOAD_HOST", "scsi-upload.lp1.scsi.srv.nintendo.net"),
-		DownloadHost:  env("SAVES_DOWNLOAD_HOST", "scsi-download.lp1.scsi.srv.nintendo.net"),
+		Providers: blob.Providers{
+			GoogleClientID: os.Getenv("SAVES_GOOGLE_CLIENT_ID"), GoogleClientSecret: os.Getenv("SAVES_GOOGLE_CLIENT_SECRET"),
+			MicrosoftClientID: os.Getenv("SAVES_MICROSOFT_CLIENT_ID"), MicrosoftClientSecret: os.Getenv("SAVES_MICROSOFT_CLIENT_SECRET"),
+		},
+		UploadHost:   env("SAVES_UPLOAD_HOST", "scsi-upload.lp1.scsi.srv.nintendo.net"),
+		DownloadHost: env("SAVES_DOWNLOAD_HOST", "scsi-download.lp1.scsi.srv.nintendo.net"),
 	}
 
 	mux := http.NewServeMux()

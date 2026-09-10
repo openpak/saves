@@ -217,14 +217,14 @@ func TestFlow(t *testing.T) {
 	}
 
 	// Sealed settings round-trip.
-	sealed, err := blob.Seal([]byte("k"), blob.S3Config{Endpoint: "e", Bucket: "b", AccessKey: "a", SecretKey: "s"})
+	sealed, err := blob.SealConfig([]byte("k"), blob.Config{Kind: blob.KindS3, S3: &blob.S3Config{Endpoint: "e", Bucket: "b", AccessKey: "a", SecretKey: "s"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg, err := blob.Open([]byte("k"), sealed); err != nil || cfg.SecretKey != "s" {
+	if cfg, err := blob.OpenConfig([]byte("k"), sealed); err != nil || cfg.S3 == nil || cfg.S3.SecretKey != "s" {
 		t.Fatalf("open sealed: %+v %v", cfg, err)
 	}
-	if _, err := blob.Open([]byte("wrong"), sealed); err == nil {
+	if _, err := blob.OpenConfig([]byte("wrong"), sealed); err == nil {
 		t.Fatal("wrong key opened the settings")
 	}
 	_ = context.Background()
