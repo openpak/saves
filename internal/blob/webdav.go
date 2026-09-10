@@ -53,8 +53,15 @@ func (w *davShare) do(ctx context.Context, method, target string, body io.Reader
 	return w.c.Do(req)
 }
 
-// mkcol creates the parent collections of a key, one level at a time; an existing one is fine.
+// mkcol creates the share's own folder and the parent collections of a key, one level at a
+// time; an existing one is fine. The folder the player named (Nextcloud: the last segment of
+// the URL) usually does not exist yet, and a PUT into a missing collection is a 409.
 func (w *davShare) mkcol(ctx context.Context, key string) error {
+	if resp, err := w.do(ctx, "MKCOL", w.base.String(), nil, 0); err == nil {
+		resp.Body.Close()
+	} else {
+		return err
+	}
 	parts := strings.Split(strings.Trim(key, "/"), "/")
 	for i := 1; i < len(parts); i++ {
 		resp, err := w.do(ctx, "MKCOL", w.href(strings.Join(parts[:i], "/"))+"/", nil, 0)

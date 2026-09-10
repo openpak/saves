@@ -27,12 +27,7 @@ func TestWebDAVBackend(t *testing.T) {
 	defer srv.Close()
 	ctx := context.Background()
 	cfg := Config{Kind: KindWebDAV, WebDAV: &WebDAVConfig{URL: srv.URL + "/saves", Username: "alice", Password: "app-pass"}}
-	// The share root itself must exist for the first MKCOL to have a parent.
-	req, _ := http.NewRequest("MKCOL", srv.URL+"/saves/", nil)
-	req.SetBasicAuth("alice", "app-pass")
-	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != http.StatusCreated {
-		t.Fatalf("share root: %v %v", err, resp)
-	}
+	// The share's own folder does not exist yet, as a freshly named Nextcloud folder would not.
 	if _, err := Test(ctx, cfg, Providers{}); err != nil {
 		t.Fatalf("test: %v", err)
 	}
