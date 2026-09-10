@@ -4,7 +4,10 @@ Cloud saves for OpenPak. Platform-neutral service on port 20020 ([`ports.md`](..
 the Switch-facing SCSI handlers are a Go package this repository exports and the Switch
 adapter mounts on 21000, per PRD collision rule 2 — they do not get their own console port.
 
-**Status: empty.** Nothing is implemented yet. See [`prds/cloud-saves-prd.md`](../prds/cloud-saves-prd.md).
+**Status: planned, nothing implemented.** The plan is [`prds/cloud-saves-prd.md`](../prds/cloud-saves-prd.md);
+what is known about the console's protocol, and from where, is [`docs/provenance.md`](docs/provenance.md).
+The first milestone is a question, not code: whether a server can mint the key seed package the
+console encrypts its saves with.
 
 ## Ground rules
 

@@ -1,0 +1,662 @@
+// Package switchscsi answers the Switch's save-data cloud. The adapter (nx-baas) owns the
+// hostnames and the bearer: it forwards every request on a scsi host here under /scsi with
+// X-OpenPak-Account (the core account id), X-OpenPak-NSA (the network service account id the
+// console logs in as) and X-OpenPak-Device set once it has proven the bearer, and nothing set
+// when it has not. The blob hosts carry no bearer at all: their URLs are the credential.
+//
+// The request set, field names and statuses are recorded with their sources in
+// docs/provenance.md. This is OpenPak's implementation of that set over the index and the
+// bytes; a console backup is one version, its component files are that version's parts.
+package switchscsi
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"openpak/saves/internal/blob"
+	"openpak/saves/internal/service"
+	"openpak/saves/internal/store"
+)
+
+const (
+	Platform      = "switch"
+	uploadWindow  = 10 * time.Minute
+	urlTTL        = time.Hour
+	metaIndex     = 0
+	saveIndexBase = 4096
+)
+
+type Server struct {
+	Svc *service.Service
+	// AllowTitles, when non-empty, is the set of title ids whose policy is ALL_OK; empty allows all.
+	AllowTitles map[string]bool
+}
+
+func (s *Server) Register(mux *http.ServeMux) {
+	mux.HandleFunc("/scsi/api/console/v3/", s.storage)
+	mux.HandleFunc("GET /scsi/api/console/v2/application_policy/{title}/{version}", s.policy)
+	mux.HandleFunc("PUT /scsi/blob/{part}", s.putBlob)
+	mux.HandleFunc("GET /scsi/blob/{part}", s.getBlob)
+}
+
+func out(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// nintendoErr is the error shape the console reads (the adapter uses the same one).
+func nintendoErr(w http.ResponseWriter, code int, kind, title, detail string) {
+	out(w, code, map[string]any{"errorCode": kind, "title": title, "detail": detail, "status": code})
+}
+
+type caller struct{ account, nsa, device string }
+
+func callerOf(r *http.Request) (caller, bool) {
+	c := caller{account: r.Header.Get("X-OpenPak-Account"), nsa: r.Header.Get("X-OpenPak-NSA"), device: r.Header.Get("X-OpenPak-Device")}
+	return c, c.account != ""
+}
+
+// ---- the wire shapes ----
+
+type component struct {
+	ID       int64   `json:"id"`
+	Index    int     `json:"index"`
+	Datatype string  `json:"datatype"`
+	Status   string  `json:"status"`
+	Size     *int64  `json:"archive_size"`
+	Digest   *string `json:"encoded_archive_digest"`
+	GetURL   string  `json:"get_url,omitempty"`
+	PutURL   string  `json:"put_url,omitempty"`
+}
+
+type archive struct {
+	ID                    int64        `json:"id"`
+	NsaID                 string       `json:"nsa_id"`
+	ApplicationID         string       `json:"application_id"`
+	DeviceID              string       `json:"device_id"`
+	DeviceSerial          string       `json:"device_serial"`
+	DataSize              int64        `json:"data_size"`
+	Desc                  *string      `json:"desc"`
+	SeriesID              uint64       `json:"series_id"`
+	Datatype              int          `json:"datatype"`
+	Status                string       `json:"status"`
+	AutoBackup            bool         `json:"auto_backup"`
+	NumOfPartitions       int          `json:"num_of_partitions"`
+	LaunchRequiredVersion int          `json:"launch_required_version"`
+	AcdIndex              int          `json:"acd_index"`
+	PlatformKeyGeneration int          `json:"platform_key_generation"`
+	PreviousID            *int64       `json:"previous_save_data_archive_id"`
+	EncodedDigest         string       `json:"encoded_digest"`
+	SavedAt               int64        `json:"saved_at_as_unixtime"`
+	FinishedAt            *int64       `json:"finished_at_as_unixtime"`
+	TimeoutAt             int64        `json:"timeout_at_as_unixtime"`
+	ComponentFiles        []*component `json:"component_files"`
+}
+
+// uploadMeta is what start_upload carries; every field is kept in the version's meta so the
+// archive reads back exactly as it was described.
+type uploadMeta struct {
+	ApplicationID         string  `json:"application_id"`
+	Datatype              int     `json:"datatype"`
+	DataSize              int64   `json:"data_size"`
+	SavedAt               int64   `json:"saved_at_as_unixtime"`
+	LaunchRequiredVersion int     `json:"launch_required_version"`
+	SeriesID              uint64  `json:"series_id"`
+	EncodedDigest         string  `json:"encoded_digest"`
+	Desc                  *string `json:"desc"`
+	AutoBackup            bool    `json:"auto_backup"`
+	AcdIndex              int     `json:"acd_index"`
+	HasThumbnail          bool    `json:"has_thumbnail"`
+}
+
+func statusOf(v *store.Version) string {
+	if v.Status == store.Live {
+		return "fixed"
+	}
+	return "uploading"
+}
+
+func partStatus(p store.Part) string {
+	switch p.Status {
+	case store.Fixed:
+		return "fixed"
+	case "uploading":
+		return "uploading"
+	}
+	return "hand_over"
+}
+
+func componentOf(p store.Part) *component {
+	c := &component{ID: p.ID, Index: p.Index, Datatype: p.Kind, Status: partStatus(p)}
+	if p.Status == store.Fixed {
+		c.Size = p.Size
+		d := p.Digest
+		c.Digest = &d
+	}
+	return c
+}
+
+func metaInt(m map[string]any, k string) int64 {
+	switch x := m[k].(type) {
+	case float64:
+		return int64(x)
+	case int64:
+		return x
+	case json.Number:
+		n, _ := x.Int64()
+		return n
+	}
+	return 0
+}
+
+func metaStr(m map[string]any, k string) string {
+	s, _ := m[k].(string)
+	return s
+}
+
+func (s *Server) archiveOf(v *store.Version, sv *store.Save, c caller, withParts bool) *archive {
+	m := v.Meta
+	a := &archive{
+		ID: v.ID, NsaID: c.nsa, ApplicationID: sv.TitleID, DeviceID: metaStr(m, "device_id"), DeviceSerial: metaStr(m, "device_serial"),
+		DataSize: metaInt(m, "data_size"), SeriesID: uint64(metaInt(m, "series_id")), Datatype: int(metaInt(m, "datatype")),
+		Status: statusOf(v), AutoBackup: m["auto_backup"] == true, LaunchRequiredVersion: int(metaInt(m, "launch_required_version")),
+		AcdIndex: int(metaInt(m, "acd_index")), EncodedDigest: metaStr(m, "encoded_digest"), SavedAt: metaInt(m, "saved_at_as_unixtime"),
+		ComponentFiles: []*component{},
+	}
+	if d, ok := m["desc"].(string); ok {
+		a.Desc = &d
+	}
+	if prev := metaInt(m, "previous_id"); prev != 0 {
+		a.PreviousID = &prev
+	}
+	if v.FinishedAt != nil {
+		t := v.FinishedAt.Unix()
+		a.FinishedAt = &t
+	}
+	if v.TimeoutAt != nil && v.Status == store.Uploading {
+		a.TimeoutAt = v.TimeoutAt.Unix()
+	}
+	for _, p := range v.Parts {
+		if p.Kind == "save" && p.Status == store.Fixed {
+			a.NumOfPartitions++
+		}
+		if withParts {
+			a.ComponentFiles = append(a.ComponentFiles, componentOf(p))
+		}
+	}
+	return a
+}
+
+// ---- routing ----
+
+func (s *Server) storage(w http.ResponseWriter, r *http.Request) {
+	c, ok := callerOf(r)
+	if !ok {
+		nintendoErr(w, http.StatusUnauthorized, "invalid_token", "Unauthorized", "The token is not valid")
+		return
+	}
+	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/scsi/api/console/v3/"), "/"), "/")
+	ctx := r.Context()
+	switch parts[0] {
+	case "network_service_accounts":
+		// .../<nsa>/notification_tokens: echoed back, as documented.
+		var in struct {
+			Token string `json:"notification_token"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		out(w, 200, map[string]any{"notification_token": in.Token})
+	case "save_data_archives":
+		s.archives(ctx, w, r, c, parts[1:])
+	case "component_files":
+		s.components(ctx, w, r, c, parts[1:])
+	default:
+		log.Printf("[scsi] UNHANDLED %s %s", r.Method, r.URL.Path)
+		nintendoErr(w, http.StatusNotFound, "resource_is_not_found", "Specified resource is not found", "Resource is not found")
+	}
+}
+
+func (s *Server) archives(ctx context.Context, w http.ResponseWriter, r *http.Request, c caller, rest []string) {
+	if len(rest) == 0 || rest[0] == "" {
+		s.list(ctx, w, r, c)
+		return
+	}
+	if rest[0] == "start_upload" {
+		s.startUpload(ctx, w, r, c, nil)
+		return
+	}
+	id, err := strconv.ParseInt(rest[0], 10, 64)
+	if err != nil {
+		nintendoErr(w, http.StatusNotFound, "resource_is_not_found", "Specified resource is not found", "Resource is not found")
+		return
+	}
+	v, sv, ok := s.owned(ctx, w, c, id)
+	if len(rest) == 1 {
+		if !ok {
+			return
+		}
+		a := s.archiveOf(v, sv, c, true)
+		if v.Status == store.Uploading {
+			s.attachPutURLs(ctx, a, v, c)
+		}
+		out(w, 200, map[string]any{"save_data_archive": a})
+		return
+	}
+	switch rest[1] {
+	case "generate_key_seed_package":
+		// M0: nobody outside Nintendo has minted one of these. The console gets fresh random
+		// bytes of the documented size, and the log records what it did next.
+		var in struct {
+			Challenge string `json:"encoded_challenge"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		pkg := make([]byte, 512)
+		_, _ = rand.Read(pkg)
+		log.Printf("[scsi] M0 key_seed_package archive=%d challenge=%q -> random 512 bytes", id, in.Challenge)
+		out(w, 200, map[string]any{"encoded_key_seed_package": base64.RawURLEncoding.EncodeToString(pkg)})
+	case "start_upload":
+		if !ok {
+			return
+		}
+		s.startUpload(ctx, w, r, c, v)
+	case "start_download":
+		if !ok {
+			return
+		}
+		a := s.archiveOf(v, sv, c, true)
+		b, err := s.Svc.BackendNamed(ctx, c.account, v.Backend)
+		if err != nil {
+			nintendoErr(w, http.StatusBadGateway, "storage_unavailable", "Storage unavailable", err.Error())
+			return
+		}
+		fixed := a.ComponentFiles[:0]
+		for _, cf := range a.ComponentFiles {
+			if cf.Status != "fixed" {
+				continue
+			}
+			cf.GetURL = s.getURL(ctx, b, v, cf.ID)
+			fixed = append(fixed, cf)
+		}
+		a.ComponentFiles = fixed
+		a.TimeoutAt = time.Now().Add(urlTTL).Unix()
+		out(w, 200, map[string]any{"save_data_archive": a})
+	case "finish_download":
+		if !ok {
+			return
+		}
+		out(w, 200, map[string]any{"save_data_archive": s.archiveOf(v, sv, c, true)})
+	case "extend_upload_timeout":
+		if !ok {
+			return
+		}
+		_ = s.Svc.Store.ExtendTimeout(ctx, v.ID, uploadWindow)
+		v, _ = s.Svc.Store.Version(ctx, v.ID)
+		out(w, 200, map[string]any{"save_data_archive": s.archiveOf(v, sv, c, true)})
+	case "finish_upload":
+		if !ok {
+			return
+		}
+		var in struct {
+			MAC string `json:"encoded_mac"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		live, gone, err := s.Svc.Store.Finish(ctx, v.ID, "")
+		if err != nil {
+			nintendoErr(w, http.StatusInternalServerError, "internal_server_error", "Internal error", err.Error())
+			return
+		}
+		for _, g := range gone {
+			s.Svc.DeleteBlobs(ctx, c.account, g)
+		}
+		s.Svc.Store.Audit(ctx, c.account, "switch_upload", map[string]any{"title": sv.TitleID, "version": live.Number, "mac": in.MAC})
+		out(w, 200, map[string]any{"save_data_archive": s.archiveOf(live, sv, c, true)})
+	case "component_files":
+		if !ok {
+			return
+		}
+		if len(rest) >= 3 && rest[2] == "create" {
+			s.createComponent(ctx, w, r, c, v, sv)
+			return
+		}
+		nintendoErr(w, http.StatusNotFound, "resource_is_not_found", "Specified resource is not found", "Resource is not found")
+	default:
+		log.Printf("[scsi] UNHANDLED archive action %s", rest[1])
+		nintendoErr(w, http.StatusNotFound, "resource_is_not_found", "Specified resource is not found", "Resource is not found")
+	}
+}
+
+// owned loads a version and checks it belongs to the caller. A miss answers the console's
+// not-found shape itself.
+func (s *Server) owned(ctx context.Context, w http.ResponseWriter, c caller, id int64) (*store.Version, *store.Save, bool) {
+	v, err := s.Svc.Store.Version(ctx, id)
+	if err == nil {
+		var saves []store.Save
+		saves, err = s.Svc.Store.Saves(ctx, c.account)
+		if err == nil {
+			for i := range saves {
+				if saves[i].ID == v.SaveID {
+					return v, &saves[i], true
+				}
+			}
+			err = store.ErrNotFound
+		}
+	}
+	if errors.Is(err, store.ErrNotFound) {
+		nintendoErr(w, http.StatusNotFound, "resource_is_not_found", "Specified resource is not found", "Resource is not found")
+	} else {
+		nintendoErr(w, http.StatusInternalServerError, "internal_server_error", "Internal error", err.Error())
+	}
+	return nil, nil, false
+}
+
+func (s *Server) list(ctx context.Context, w http.ResponseWriter, r *http.Request, c caller) {
+	q := r.URL.Query()
+	saves, err := s.Svc.Store.Saves(ctx, c.account)
+	if err != nil {
+		nintendoErr(w, http.StatusInternalServerError, "internal_server_error", "Internal error", err.Error())
+		return
+	}
+	list := []*archive{}
+	for i := range saves {
+		sv := &saves[i]
+		if sv.Platform != Platform || (q.Get("application_id") != "" && !strings.EqualFold(q.Get("application_id"), sv.TitleID)) {
+			continue
+		}
+		vs, err := s.Svc.Store.Versions(ctx, sv.ID, false)
+		if err != nil {
+			nintendoErr(w, http.StatusInternalServerError, "internal_server_error", "Internal error", err.Error())
+			return
+		}
+		for i := range vs {
+			a := s.archiveOf(&vs[i], sv, c, false)
+			if dt := q.Get("datatype"); dt != "" && dt != strconv.Itoa(a.Datatype) {
+				continue
+			}
+			a.ComponentFiles = nil
+			list = append(list, a)
+		}
+	}
+	out(w, 200, map[string]any{"save_data_archives": list})
+}
+
+// startUpload opens a new version. With a previous archive the console re-describes the same
+// component set (a delta upload); without one it starts from a lone meta component and
+// creates the rest itself.
+func (s *Server) startUpload(ctx context.Context, w http.ResponseWriter, r *http.Request, c caller, prev *store.Version) {
+	var in uploadMeta
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
+	_ = json.Unmarshal(body, &in)
+	title := strings.ToLower(in.ApplicationID)
+	var base *int
+	var prevSave *store.Save
+	if prev != nil {
+		saves, _ := s.Svc.Store.Saves(ctx, c.account)
+		for i := range saves {
+			if saves[i].ID == prev.SaveID {
+				prevSave = &saves[i]
+			}
+		}
+		if prevSave != nil {
+			if title == "" {
+				title = prevSave.TitleID
+			}
+			base = &prev.Number
+		}
+	}
+	if title == "" {
+		nintendoErr(w, http.StatusBadRequest, "invalid_parameter", "Invalid parameter", "application_id is required")
+		return
+	}
+	name, _, err := s.Svc.BackendFor(ctx, c.account)
+	if err != nil {
+		nintendoErr(w, http.StatusBadGateway, "storage_unavailable", "Storage unavailable", err.Error())
+		return
+	}
+	if err := s.Svc.CheckAllowance(ctx, c.account, name, in.DataSize); err != nil {
+		var q store.ErrQuota
+		if errors.As(err, &q) {
+			nintendoErr(w, http.StatusForbidden, "storage_quota_exceeded", "Not enough space", fmt.Sprintf("%d of %d bytes used; connect your own storage on openpak.org", q.Used, q.Limit))
+			return
+		}
+		nintendoErr(w, http.StatusInternalServerError, "internal_server_error", "Internal error", err.Error())
+		return
+	}
+	sv, err := s.Svc.Store.EnsureSave(ctx, c.account, Platform, title)
+	if err != nil {
+		nintendoErr(w, http.StatusInternalServerError, "internal_server_error", "Internal error", err.Error())
+		return
+	}
+	var meta map[string]any
+	_ = json.Unmarshal(body, &meta)
+	if meta == nil {
+		meta = map[string]any{}
+	}
+	meta["device_id"], meta["device_serial"] = c.device, ""
+	if prev != nil {
+		meta["previous_id"] = prev.ID
+		if meta["device_id"] == "" {
+			meta["device_id"] = metaStr(prev.Meta, "device_id")
+		}
+	}
+	savedAt := time.Unix(in.SavedAt, 0)
+	v, err := s.Svc.Store.NewVersion(ctx, sv.ID, base, c.device, name, meta, in.DataSize, &savedAt, uploadWindow)
+	if err != nil {
+		nintendoErr(w, http.StatusInternalServerError, "internal_server_error", "Internal error", err.Error())
+		return
+	}
+	// Components: mirror the previous archive's set, or start with meta alone.
+	shape := []store.Part{{Index: metaIndex, Kind: "meta"}}
+	if prev != nil && len(prev.Parts) > 0 {
+		shape = prev.Parts
+	}
+	for _, p := range shape {
+		if _, err := s.Svc.Store.AddPart(ctx, v.ID, p.Index, p.Kind, service.Key(c.account, Platform, title, v.ID, p.Index)); err != nil {
+			nintendoErr(w, http.StatusInternalServerError, "internal_server_error", "Internal error", err.Error())
+			return
+		}
+	}
+	v, _ = s.Svc.Store.Version(ctx, v.ID)
+	a := s.archiveOf(v, sv, c, true)
+	// The previous archive's sizes and digests ride along on a delta upload's components.
+	if prev != nil {
+		for _, cf := range a.ComponentFiles {
+			for _, pp := range prev.Parts {
+				if pp.Index == cf.Index && pp.Status == store.Fixed {
+					cf.Size, cf.Digest = pp.Size, strPtr(pp.Digest)
+				}
+			}
+		}
+	}
+	log.Printf("[scsi] start_upload account=%s title=%s version=%d backend=%s parts=%d conflict=%v", c.account, title, v.Number, name, len(v.Parts), v.Conflict)
+	out(w, http.StatusCreated, map[string]any{"save_data_archive": a})
+}
+
+func strPtr(s string) *string { return &s }
+
+func (s *Server) createComponent(ctx context.Context, w http.ResponseWriter, r *http.Request, c caller, v *store.Version, sv *store.Save) {
+	var in struct {
+		Index    int    `json:"index"`
+		Datatype string `json:"datatype"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&in)
+	if in.Datatype == "" {
+		in.Datatype = "save"
+	}
+	p, err := s.Svc.Store.AddPart(ctx, v.ID, in.Index, in.Datatype, service.Key(c.account, Platform, sv.TitleID, v.ID, in.Index))
+	if err != nil {
+		nintendoErr(w, http.StatusInternalServerError, "internal_server_error", "Internal error", err.Error())
+		return
+	}
+	cf := componentOf(*p)
+	cf.PutURL = s.putURL(ctx, c, v, p)
+	out(w, http.StatusCreated, map[string]any{"component_file": cf})
+}
+
+func (s *Server) components(ctx context.Context, w http.ResponseWriter, r *http.Request, c caller, rest []string) {
+	if len(rest) < 2 {
+		nintendoErr(w, http.StatusNotFound, "resource_is_not_found", "Specified resource is not found", "Resource is not found")
+		return
+	}
+	id, _ := strconv.ParseInt(rest[0], 10, 64)
+	p, err := s.Svc.Store.Part(ctx, id)
+	if err != nil {
+		nintendoErr(w, http.StatusNotFound, "resource_is_not_found", "Specified resource is not found", "Resource is not found")
+		return
+	}
+	v, _, ok := s.owned(ctx, w, c, p.VersionID)
+	if !ok {
+		return
+	}
+	switch rest[1] {
+	case "signed_uri":
+		b, err := s.Svc.BackendNamed(ctx, c.account, v.Backend)
+		if err != nil {
+			nintendoErr(w, http.StatusBadGateway, "storage_unavailable", "Storage unavailable", err.Error())
+			return
+		}
+		cf := componentOf(*p)
+		cf.GetURL = s.getURL(ctx, b, v, p.ID)
+		out(w, 200, map[string]any{"component_file": cf})
+	case "update":
+		_ = s.Svc.Store.SetPartStatus(ctx, p.ID, "uploading", nil, "")
+		p.Status = "uploading"
+		cf := componentOf(*p)
+		cf.Size, cf.Digest = nil, nil
+		cf.PutURL = s.putURL(ctx, c, v, p)
+		out(w, 200, map[string]any{"component_file": cf})
+	case "finish_upload":
+		var in struct {
+			Size   int64  `json:"archive_size"`
+			Digest string `json:"encoded_archive_digest"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		// The bytes are the fact: a part whose stored size disagrees with the console's
+		// claim is not fixed, and the console will retry or abandon the archive.
+		b, err := s.Svc.BackendNamed(ctx, c.account, v.Backend)
+		if err != nil {
+			nintendoErr(w, http.StatusBadGateway, "storage_unavailable", "Storage unavailable", err.Error())
+			return
+		}
+		got, err := b.Stat(ctx, p.Key)
+		if err != nil || (in.Size != 0 && got != in.Size) {
+			log.Printf("[scsi] component %d finish_upload: stored %d bytes, console says %d (%v)", p.ID, got, in.Size, err)
+			nintendoErr(w, http.StatusConflict, "upload_incomplete", "Upload incomplete", "the uploaded size does not match")
+			return
+		}
+		_ = s.Svc.Store.SetPartStatus(ctx, p.ID, store.Fixed, &got, in.Digest)
+		p, _ = s.Svc.Store.Part(ctx, p.ID)
+		out(w, 200, map[string]any{"component_file": componentOf(*p)})
+	default:
+		nintendoErr(w, http.StatusNotFound, "resource_is_not_found", "Specified resource is not found", "Resource is not found")
+	}
+}
+
+// putURL and getURL are where the bytes go and come from: the player's own bucket when it
+// presigns, else the allowance blob hosts with an OpenPak-signed URL.
+func (s *Server) putURL(ctx context.Context, c caller, v *store.Version, p *store.Part) string {
+	if b, err := s.Svc.BackendNamed(ctx, c.account, v.Backend); err == nil {
+		if ps, ok := b.(blob.Presigner); ok {
+			if u, err := ps.PresignPut(ctx, p.Key, urlTTL); err == nil {
+				return u
+			} else {
+				log.Printf("[scsi] presign put: %v", err)
+			}
+		}
+	}
+	return s.Svc.BlobURL("PUT", p.ID, urlTTL)
+}
+
+func (s *Server) getURL(ctx context.Context, b blob.Backend, v *store.Version, partID int64) string {
+	if ps, ok := b.(blob.Presigner); ok {
+		for _, p := range v.Parts {
+			if p.ID == partID {
+				if u, err := ps.PresignGet(ctx, p.Key, urlTTL); err == nil {
+					return u
+				}
+			}
+		}
+	}
+	return s.Svc.BlobURL("GET", partID, urlTTL)
+}
+
+func (s *Server) attachPutURLs(ctx context.Context, a *archive, v *store.Version, c caller) {
+	a.TimeoutAt = time.Now().Add(urlTTL).Unix()
+	for _, cf := range a.ComponentFiles {
+		if cf.Status == "fixed" {
+			continue
+		}
+		for i := range v.Parts {
+			if v.Parts[i].ID == cf.ID {
+				cf.PutURL = s.putURL(ctx, c, v, &v.Parts[i])
+			}
+		}
+	}
+}
+
+// ---- the blob hosts: allowance backend only ----
+
+func (s *Server) blobPart(w http.ResponseWriter, r *http.Request) (*store.Part, bool) {
+	id, ok := s.Svc.VerifyBlobURL(r.Method, "/blob/"+r.PathValue("part"), r.URL.Query().Get("exp"), r.URL.Query().Get("sig"))
+	if !ok {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return nil, false
+	}
+	p, err := s.Svc.Store.Part(r.Context(), id)
+	if err != nil {
+		http.NotFound(w, r)
+		return nil, false
+	}
+	return p, true
+}
+
+func (s *Server) putBlob(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.blobPart(w, r)
+	if !ok {
+		return
+	}
+	n, digest, err := s.Svc.PutPart(r.Context(), s.Svc.Local, p, r.Body, r.ContentLength)
+	if err != nil {
+		log.Printf("[scsi] blob put part=%d: %v", p.ID, err)
+		http.Error(w, "write failed", http.StatusInternalServerError)
+		return
+	}
+	// The console's own finish_upload sets the digest it computed; ours goes in meanwhile.
+	_ = s.Svc.Store.SetPartStatus(r.Context(), p.ID, "uploading", &n, "sha256:"+digest)
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) getBlob(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.blobPart(w, r)
+	if !ok {
+		return
+	}
+	rc, size, err := s.Svc.Local.Get(r.Context(), p.Key)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer rc.Close()
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+	_, _ = io.Copy(w, rc)
+}
+
+// policy: whether a title may back up at all. ALL_OK unless a list says otherwise.
+func (s *Server) policy(w http.ResponseWriter, r *http.Request) {
+	title := strings.ToLower(r.PathValue("title"))
+	if len(s.AllowTitles) > 0 && !s.AllowTitles[title] {
+		out(w, 200, map[string]any{"policy_type": "ALL_NG"})
+		return
+	}
+	out(w, 200, map[string]any{"policy_type": "ALL_OK"})
+}
