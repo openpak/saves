@@ -3,7 +3,7 @@
 Cloud saves for OpenPak. Platform-neutral service on port 20020 ([`ports.md`](../ports.md)):
 the index of every save under an account, a small OpenPak-hosted allowance per account, and
 the player's own S3-compatible storage for everything beyond it. The plan is
-[`prds/cloud-saves-prd.md`](../prds/cloud-saves-prd.md); what is known about the console's
+[`prds/cloud-saves-prd.md`](prds/cloud-saves-prd.md); what is known about the console's
 protocol, and from where, is [`docs/provenance.md`](docs/provenance.md).
 
 **Status (2026-09-10): built and deployed.** Emulator and website surfaces work end to end.
