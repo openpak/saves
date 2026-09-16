@@ -418,22 +418,10 @@ func (s *Store) Finish(ctx context.Context, id int64, sha256 string) (*Version, 
 		}
 		return nil, nil, err
 	}
-	// Retention: everything live, unpinned, beyond the newest Keep goes.
-	rows, err := tx.QueryContext(ctx, `UPDATE versions SET status='deleted' WHERE id IN (
-		SELECT id FROM versions WHERE save_id=$1 AND status='live' AND NOT pinned ORDER BY number DESC OFFSET $2) RETURNING id`, saveID, Keep)
+	goneIDs, err := prune(ctx, tx, saveID)
 	if err != nil {
 		return nil, nil, err
 	}
-	var goneIDs []int64
-	for rows.Next() {
-		var gid int64
-		if err := rows.Scan(&gid); err != nil {
-			rows.Close()
-			return nil, nil, err
-		}
-		goneIDs = append(goneIDs, gid)
-	}
-	rows.Close()
 	if err := tx.Commit(); err != nil {
 		return nil, nil, err
 	}
@@ -449,6 +437,37 @@ func (s *Store) Finish(ctx context.Context, id int64, sha256 string) (*Version, 
 		}
 	}
 	return v, gone, nil
+}
+
+// prune is retention: everything live, unpinned and beyond the newest Keep goes. A conflict
+// is never pruned automatically — it is the one copy of progress nobody has looked at yet.
+func prune(ctx context.Context, tx *sql.Tx, saveID int64) ([]int64, error) {
+	rows, err := tx.QueryContext(ctx, `UPDATE versions SET status='deleted' WHERE id IN (
+		SELECT id FROM versions WHERE save_id=$1 AND status='live' AND NOT pinned AND NOT conflict ORDER BY number DESC OFFSET $2) RETURNING id`, saveID, Keep)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// KeyInUse says whether another version still points at these bytes, so a deletion knows to
+// leave them alone. Restoring a version shares its parts' keys rather than copying bytes, and
+// that is the only way one key belongs to two versions.
+func (s *Store) KeyInUse(ctx context.Context, key string, exceptVersion int64, loc Location) (bool, error) {
+	var yes bool
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM parts p JOIN versions v ON v.id=p.version_id
+		WHERE p.key=$1 AND v.id<>$2 AND v.status<>'deleted' AND v.backend=$3 AND (v.location=$4 OR v.location=''))`,
+		key, exceptVersion, loc.Backend, loc.ID).Scan(&yes)
+	return yes, err
 }
 
 // MarkDeleted retires a version; the caller deletes its blobs afterwards.
@@ -472,11 +491,66 @@ func (s *Store) SetPinned(ctx context.Context, id int64, pinned bool) error {
 	return err
 }
 
-// Restore makes an older live version the newest by renumbering it: no bytes move.
-func (s *Store) Restore(ctx context.Context, id int64) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE versions SET number=(SELECT max(number)+1 FROM versions WHERE save_id=v2.save_id), conflict=false
-		FROM (SELECT save_id FROM versions WHERE id=$1 AND status='live') v2 WHERE versions.id=$1`, id)
-	return err
+// Restore makes an older version current again by writing a new one that describes the same
+// content: same parts, same keys, same storage location, a fresh number, and the version it
+// came from recorded in its meta. No bytes move and nothing already handed to a client changes
+// meaning — the version numbers a device holds as its base still point at what they did.
+//
+// ponytail: the restored version counts its shared bytes against the allowance a second time.
+// Make Usage count distinct part keys if that ever bites; over-counting only ever refuses.
+func (s *Store) Restore(ctx context.Context, id int64) (*Version, []Version, error) {
+	src, err := s.Version(ctx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	if src.Status != Live {
+		return nil, nil, fmt.Errorf("only a live version can be restored")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext(account_id)::bigint) FROM saves WHERE id=$1`, src.SaveID); err != nil {
+		return nil, nil, err
+	}
+	meta := map[string]any{}
+	for k, v := range src.Meta {
+		meta[k] = v
+	}
+	meta["restored_from"] = src.ID
+	mj, _ := json.Marshal(meta)
+	var newID int64
+	var number int
+	if err := tx.QueryRowContext(ctx, `INSERT INTO versions (save_id, number, base_number, status, conflict, pinned, size, sha256, device, backend, location, meta, saved_at, finished_at)
+		SELECT save_id, (SELECT coalesce(max(number),0)+1 FROM versions WHERE save_id=v.save_id),
+			(SELECT max(number) FROM versions WHERE save_id=v.save_id AND status='live'),
+			'live', false, false, size, sha256, device, backend, location, $2, saved_at, now()
+		FROM versions v WHERE v.id=$1 RETURNING id, number`, id, mj).Scan(&newID, &number); err != nil {
+		return nil, nil, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO parts (version_id, idx, kind, status, size, digest, key)
+		SELECT $2, idx, kind, status, size, digest, key FROM parts WHERE version_id=$1`, id, newID); err != nil {
+		return nil, nil, err
+	}
+	goneIDs, err := prune(ctx, tx, src.SaveID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, err
+	}
+	v, err := s.Version(ctx, newID)
+	if err != nil {
+		return nil, nil, err
+	}
+	var gone []Version
+	for _, gid := range goneIDs {
+		if g, err := s.Version(ctx, gid); err == nil {
+			gone = append(gone, *g)
+		}
+	}
+	return v, gone, nil
 }
 
 // SetLocation records that a version's parts now live somewhere else: the move is what makes
@@ -496,6 +570,26 @@ func (s *Store) Usage(ctx context.Context, account, backend string) (inBackend, 
 // LiveVersions lists every live version an account holds in one backend, parts included.
 func (s *Store) LiveVersions(ctx context.Context, account, backend string) ([]Version, error) {
 	rows, err := s.db.QueryContext(ctx, versionSelect+` JOIN saves s ON s.id=v.save_id WHERE s.account_id=$1 AND v.backend=$2 AND v.status='live' ORDER BY v.id`, account, backend)
+	if err != nil {
+		return nil, err
+	}
+	vs, err := scanVersions(rows)
+	if err != nil {
+		return nil, err
+	}
+	for i := range vs {
+		if _, err := s.withParts(ctx, &vs[i]); err != nil {
+			return nil, err
+		}
+	}
+	return vs, nil
+}
+
+// LiveVersionsElsewhere lists every live version of an account that is not already stored at
+// loc: what a move has left to do, and the reason a move can simply be run again.
+func (s *Store) LiveVersionsElsewhere(ctx context.Context, account string, loc Location) ([]Version, error) {
+	rows, err := s.db.QueryContext(ctx, versionSelect+` JOIN saves s ON s.id=v.save_id
+		WHERE s.account_id=$1 AND v.status='live' AND NOT (v.backend=$2 AND (v.location=$3 OR v.location='')) ORDER BY v.id`, account, loc.Backend, loc.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -553,6 +647,13 @@ func (s *Store) ExtendTimeout(ctx context.Context, id int64, d time.Duration) er
 	return err
 }
 
+// SetMeta replaces a version's meta, for what is learned after it was opened.
+func (s *Store) SetMeta(ctx context.Context, id int64, meta map[string]any) error {
+	mj, _ := json.Marshal(meta)
+	_, err := s.db.ExecContext(ctx, `UPDATE versions SET meta=$2 WHERE id=$1`, id, mj)
+	return err
+}
+
 func (s *Store) SetPartKey(ctx context.Context, id int64, key string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE parts SET key=$2 WHERE id=$1`, id, key)
 	return err
@@ -603,6 +704,17 @@ func (s *Store) SetTestResult(ctx context.Context, account string, ok bool, msg 
 func (s *Store) SetMoveState(ctx context.Context, account, state string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE storage_settings SET move_state=$2 WHERE account_id=$1`, account, state)
 	return err
+}
+
+// ClearRunningMoves is called at startup: a move is a goroutine, so one that was running when
+// the process stopped is not running now, whatever its settings row still says.
+func (s *Store) ClearRunningMoves(ctx context.Context) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE storage_settings SET move_state='interrupted: run it again' WHERE move_state LIKE 'moving%'`)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 func (s *Store) Audit(ctx context.Context, account, action string, detail map[string]any) {

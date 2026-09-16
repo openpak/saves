@@ -15,7 +15,7 @@
 //	GET    /internal/storage/oauth/{provider}/url?redirect_uri=&state=   the consent page
 //	POST   /internal/accounts/{account}/storage/oauth {provider, code, redirect_uri}  finish a consent
 //	DELETE /internal/accounts/{account}/storage
-//	POST   /internal/accounts/{account}/storage/move
+//	POST   /internal/accounts/{account}/storage/move[?to=allowance]   to the player's storage, or back
 package api
 
 import (
@@ -29,6 +29,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"openpak/saves/internal/blob"
@@ -346,12 +347,18 @@ func (s *Server) restore(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := s.Svc.Store.Restore(r.Context(), v.ID); err != nil {
+	// Restoring writes a new current version over the same bytes; the one it came from stays
+	// exactly where it was.
+	nv, gone, err := s.Svc.Store.Restore(r.Context(), v.ID)
+	if err != nil {
 		failWith(w, err)
 		return
 	}
-	s.Svc.Store.Audit(r.Context(), r.PathValue("account"), "restore", map[string]any{"version": v.ID})
-	jsonOut(w, 200, map[string]any{"restored": v.ID})
+	for _, g := range gone {
+		s.Svc.DeleteBlobs(r.Context(), r.PathValue("account"), g)
+	}
+	s.Svc.Store.Audit(r.Context(), r.PathValue("account"), "restore", map[string]any{"from": v.ID, "version": nv.ID})
+	jsonOut(w, 200, map[string]any{"restored": v.ID, "version": versionJSON(*nv)})
 }
 
 func (s *Server) deleteVersion(w http.ResponseWriter, r *http.Request) {
@@ -534,17 +541,20 @@ func (s *Server) deleteStorage(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// move sends an account's stored versions to its own storage, or with ?to=allowance brings
+// them back to OpenPak's. Either way it runs in the background and can be run again.
 func (s *Server) move(w http.ResponseWriter, r *http.Request) {
 	account := r.PathValue("account")
+	toAllowance := r.URL.Query().Get("to") == "allowance"
 	st, err := s.Svc.Store.Settings(r.Context(), account)
-	if err != nil {
+	if err != nil && !toAllowance {
 		jsonErr(w, http.StatusConflict, "no storage connected")
 		return
 	}
-	if st.MoveState == "moving" {
+	if st != nil && strings.HasPrefix(st.MoveState, "moving") {
 		jsonErr(w, http.StatusConflict, "a move is already running")
 		return
 	}
-	go s.Svc.Move(account)
+	go s.Svc.Move(account, toAllowance)
 	jsonOut(w, http.StatusAccepted, map[string]any{"move_state": "moving"})
 }

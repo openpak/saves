@@ -134,6 +134,16 @@ func (s *Service) DeleteBlobs(ctx context.Context, account string, v store.Versi
 		return
 	}
 	for _, p := range v.Parts {
+		// A version restored from this one shares its parts' keys: those bytes are still
+		// somebody's current save.
+		used, err := s.Store.KeyInUse(ctx, p.Key, v.ID, v.Loc())
+		if err != nil {
+			log.Printf("[saves] version %d part %d: %v", v.ID, p.ID, err)
+			return
+		}
+		if used {
+			continue
+		}
 		if err := b.Delete(ctx, p.Key); err != nil {
 			log.Printf("[saves] version %d part %d: delete: %v", v.ID, p.ID, err)
 			return
@@ -142,45 +152,61 @@ func (s *Service) DeleteBlobs(ctx context.Context, account string, v store.Versi
 	_ = s.Store.Forget(ctx, v.ID)
 }
 
-// Move copies every live version an account holds on the allowance into its own storage,
-// verifying sizes, then frees the allowance. It runs in the background; progress is the
-// settings row's move_state.
-func (s *Service) Move(account string) {
+// Move copies every live version that is not already at the destination into it, verifies each
+// object by reading it back, and only then points the index at the copy. The source bytes go
+// last, and only the ones nothing else still refers to.
+//
+// It is durable in the only way that matters: nothing is deleted before the index points at a
+// verified copy, so a crash leaves at worst an orphan at the destination and a version still
+// readable where it was. Running it again picks up whatever is still in the old place — which
+// is what "resume" means here, rather than a job queue.
+//
+// toAllowance moves the other way, back onto OpenPak's own storage, and is bounded by it.
+func (s *Service) Move(account string, toAllowance bool) {
 	ctx := context.Background()
-	_ = s.Store.SetMoveState(ctx, account, "moving")
 	fail := func(err error) {
 		log.Printf("[saves] move %s: %v", account, err)
 		_ = s.Store.SetMoveState(ctx, account, "failed: "+err.Error())
 	}
-	dstLoc, dst, err := s.BackendFor(ctx, account)
+	dstLoc, dst := store.Location{Backend: blob.Local, ID: blob.Local}, s.Local
+	if !toAllowance {
+		var err error
+		if dstLoc, dst, err = s.BackendFor(ctx, account); err != nil {
+			fail(err)
+			return
+		}
+		if dstLoc.Backend == blob.Local {
+			fail(errors.New("no storage connected"))
+			return
+		}
+	}
+	_ = s.Store.SetMoveState(ctx, account, "moving")
+	vs, err := s.Store.LiveVersionsElsewhere(ctx, account, dstLoc)
 	if err != nil {
 		fail(err)
 		return
 	}
-	if dstLoc.Backend == blob.Local {
-		fail(errors.New("no storage connected"))
-		return
+	type source struct {
+		loc     store.Location
+		key     string
+		version int64
 	}
-	vs, err := s.Store.LiveVersions(ctx, account, blob.Local)
-	if err != nil {
-		fail(err)
-		return
-	}
-	for _, v := range vs {
+	var freed []source
+	for i, v := range vs {
+		src, err := s.BackendAt(ctx, account, v.Loc())
+		if err != nil {
+			fail(fmt.Errorf("version %d: %w", v.ID, err))
+			return
+		}
+		if toAllowance {
+			if err := s.CheckAllowance(ctx, account, blob.Local, v.Size); err != nil {
+				fail(fmt.Errorf("version %d: %w", v.ID, err))
+				return
+			}
+		}
 		for _, p := range v.Parts {
-			rc, size, err := s.Local.Get(ctx, p.Key)
-			if err != nil {
+			if err := copyVerified(ctx, src, dst, p.Key); err != nil {
 				fail(fmt.Errorf("version %d: %w", v.ID, err))
-				return
-			}
-			err = dst.Put(ctx, p.Key, rc, size)
-			rc.Close()
-			if err != nil {
-				fail(fmt.Errorf("version %d: %w", v.ID, err))
-				return
-			}
-			if got, err := dst.Stat(ctx, p.Key); err != nil || got != size {
-				fail(fmt.Errorf("version %d: copied %d bytes, expected %d (%v)", v.ID, got, size, err))
 				return
 			}
 		}
@@ -189,11 +215,57 @@ func (s *Service) Move(account string) {
 			return
 		}
 		for _, p := range v.Parts {
-			_ = s.Local.Delete(ctx, p.Key)
+			freed = append(freed, source{loc: v.Loc(), key: p.Key, version: v.ID})
+		}
+		_ = s.Store.SetMoveState(ctx, account, fmt.Sprintf("moving: %d of %d", i+1, len(vs)))
+	}
+	for _, f := range freed {
+		used, err := s.Store.KeyInUse(ctx, f.key, f.version, f.loc)
+		if err != nil || used {
+			continue
+		}
+		b, err := s.BackendAt(ctx, account, f.loc)
+		if err != nil {
+			log.Printf("[saves] move %s: the old storage kept %s: %v", account, f.key, err)
+			continue
+		}
+		if err := b.Delete(ctx, f.key); err != nil {
+			log.Printf("[saves] move %s: the old storage kept %s: %v", account, f.key, err)
 		}
 	}
-	s.Store.Audit(ctx, account, "move", map[string]any{"versions": len(vs)})
+	s.Store.Audit(ctx, account, "move", map[string]any{"versions": len(vs), "to": dstLoc.ID})
 	_ = s.Store.SetMoveState(ctx, account, fmt.Sprintf("done: %d versions", len(vs)))
+}
+
+// copyVerified copies one object and proves the copy: the destination is read back and
+// digested, because a matching length is not evidence and a save that silently differs is a
+// save lost. The price is reading every moved byte twice, which a migration can afford.
+func copyVerified(ctx context.Context, src, dst blob.Backend, key string) error {
+	rc, size, err := src.Get(ctx, key)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", key, err)
+	}
+	h := sha256.New()
+	err = dst.Put(ctx, key, io.TeeReader(rc, h), size)
+	rc.Close()
+	if err != nil {
+		return fmt.Errorf("write %s: %w", key, err)
+	}
+	back, got, err := dst.Get(ctx, key)
+	if err != nil {
+		return fmt.Errorf("read back %s: %w", key, err)
+	}
+	g := sha256.New()
+	_, err = io.Copy(g, back)
+	back.Close()
+	if err != nil {
+		return fmt.Errorf("read back %s: %w", key, err)
+	}
+	if (size >= 0 && got != size) || !hmac.Equal(g.Sum(nil), h.Sum(nil)) {
+		_ = dst.Delete(ctx, key)
+		return fmt.Errorf("%s: the copy does not match the original", key)
+	}
+	return nil
 }
 
 // Quota is the limit NewVersion reserves against: the allowance on the hosted backend, and

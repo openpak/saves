@@ -58,6 +58,9 @@ func main() {
 	allowance, _ := strconv.ParseInt(env("SAVES_ALLOWANCE_BYTES", "268435456"), 10, 64)
 	// Off by default: player storage on this host's own network is an administrator's choice.
 	blob.AllowPrivateStorage = os.Getenv("SAVES_ALLOW_PRIVATE_STORAGE") != ""
+	if n, err := st.ClearRunningMoves(context.Background()); err == nil && n > 0 {
+		log.Printf("saves: %d storage move(s) were running when this process last stopped; marked interrupted", n)
+	}
 	credKey := required("SAVES_CREDENTIAL_KEY")
 	if len(credKey) < 32 {
 		log.Fatal("SAVES_CREDENTIAL_KEY must be at least 32 bytes")
@@ -86,7 +89,7 @@ func main() {
 			allow[t] = true
 		}
 	}
-	(&switchscsi.Server{Svc: svc, AllowTitles: allow}).Register(mux)
+	(&switchscsi.Server{Svc: svc, AllowTitles: allow, KeySeed: os.Getenv("SAVES_M0_KEY_SEED") != ""}).Register(mux)
 
 	go func() {
 		for {

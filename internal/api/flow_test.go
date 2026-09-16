@@ -366,6 +366,76 @@ func TestFlow(t *testing.T) {
 		t.Fatalf("export lost a component: %+v", inZip)
 	}
 
+	// M0 is an experiment, not a service: without SAVES_M0_KEY_SEED nothing is minted.
+	if resp := do("POST", "/scsi/api/console/v3/save_data_archives/"+aid+"/generate_key_seed_package", strings.NewReader(`{"encoded_challenge":"AAAA"}`), sw); resp.StatusCode != 503 {
+		t.Fatalf("the key seed experiment must be off by default, got %d", resp.StatusCode)
+	} else {
+		resp.Body.Close()
+	}
+
+	// The console deletes a backup from its own screen (firmware: .../delete?force=true).
+	if resp := do("POST", "/scsi/api/console/v3/save_data_archives/"+aid+"/delete?force=true", nil, sw); resp.StatusCode != 200 {
+		t.Fatalf("delete: %d", resp.StatusCode)
+	} else {
+		resp.Body.Close()
+	}
+	resp = do("GET", "/scsi/api/console/v3/save_data_archives?datatype=0&application_id=0100152000022000", nil, sw)
+	var after struct {
+		A []any `json:"save_data_archives"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&after)
+	resp.Body.Close()
+	if len(after.A) != 0 {
+		t.Fatalf("a deleted archive is still listed: %+v", after.A)
+	}
+
+	// Restoring writes a new current version over the same bytes, and the version it came from
+	// keeps its number and its content — including when it is deleted afterwards.
+	resp = do("GET", base+"/saves", nil, nil)
+	var before struct {
+		Saves []api.SaveJSON `json:"saves"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&before)
+	resp.Body.Close()
+	var conflictID int64
+	for _, sv := range before.Saves {
+		if sv.TitleID != "0100abcd" {
+			continue
+		}
+		for _, ver := range sv.Versions {
+			if ver.Number == 3 {
+				conflictID = ver.ID
+			}
+		}
+	}
+	if conflictID == 0 {
+		t.Fatal("the conflict version is gone")
+	}
+	resp = do("POST", base+"/versions/"+fmt.Sprint(conflictID)+"/restore", nil, nil)
+	var restored struct {
+		Version api.VersionJSON `json:"version"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&restored)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || restored.Version.Number != 4 || restored.Version.ID == conflictID {
+		t.Fatalf("restore must write a new version: %d %+v", resp.StatusCode, restored.Version)
+	}
+	resp = do("GET", base+"/saves/citron/0100abcd", nil, nil)
+	got, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(got) != "save-12" || resp.Header.Get("X-Save-Version") != "4" {
+		t.Fatalf("restored current: %q v=%s", got, resp.Header.Get("X-Save-Version"))
+	}
+	if resp := do("DELETE", base+"/versions/"+fmt.Sprint(conflictID), nil, nil); resp.StatusCode != 204 {
+		t.Fatalf("deleting the version restored from: %d", resp.StatusCode)
+	}
+	resp = do("GET", base+"/saves/citron/0100abcd", nil, nil)
+	got, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(got) != "save-12" {
+		t.Fatalf("deleting the source took the restored version's bytes with it: %q", got)
+	}
+
 	// Sealed settings round-trip.
 	sealed, err := blob.SealConfig([]byte("k"), blob.Config{Kind: blob.KindS3, S3: &blob.S3Config{Endpoint: "e", Bucket: "b", AccessKey: "a", SecretKey: "s"}})
 	if err != nil {

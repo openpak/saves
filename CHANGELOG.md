@@ -14,6 +14,10 @@ of truth; this file is the readable summary.
 - a rotated OAuth refresh token is sealed back into the settings it came from
 - console backups export whole, as a zip of their components
 - player storage on this deployment’s own network is refused unless an administrator allows it
+- restore writes a new version over the same bytes; the one it came from keeps its number
+- the move verifies every object by reading it back, can be run again, and goes both ways
+- the console can delete a backup (firmware 22.5.0: `save_data_archives/<id>/delete`)
+- the M0 key-seed experiment is off unless SAVES_M0_KEY_SEED says otherwise
 - release: job-scoped registry auth file [989d4b7]
 - release: build on the self-hosted runner with podman; private-repo minutes are metered [1f2bc15]
 - Go 1.26, the house version [f2b0613]

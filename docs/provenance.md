@@ -13,6 +13,10 @@ Sources:
 - **K** — Kinnay's NintendoClients wiki, pages *OLSC Servers* and *Server List*.
 - **C** — our own console, through the Switch adapter's debug log (2026-09-07).
 - **B** — `Openpak/nx-baas/services.go`, what the adapter answers today.
+- **F** — the console's own firmware, 22.5.0: the `olsc` system module (the save-data cloud
+  client) from the local audit tree, `all/olsc/strings.txt`, read 2026-09-16. Offsets in
+  brackets are string-table offsets in that dump. This is first-party evidence and outranks
+  everything else here: where F and N disagree, F is the console and N is somebody's server.
 
 ## Hostnames
 
@@ -62,9 +66,53 @@ now+600 on `extend_upload_timeout` (N). It returns no structured error body at a
 for an unknown path, archive or component, and a 500 with plain text when a blob write fails
 (N). **Unexplained:** what the console shows for each, and whether it needs a body.
 
-There is no delete route in the set: N never removes an archive, and the console's own
-save-data cloud screen has no observed delete request. **Unexplained:** how a console asks for
-a backup to be forgotten, if it can at all.
+**Corrected 2026-09-16:** an earlier note here said there is no delete route, on the evidence
+that N never implemented one. F has it — `save_data_archives/%llu/delete?force=true` [1468615]
+— and the adapter now answers it. Absence from somebody else's server was never evidence of
+absence from the console.
+
+### The whole request set the console can build (F)
+
+Every URL `olsc` formats, in the two forms it uses: `%s/api/%s/v%d/...`, where the API segment
+and the version are runtime values (ours sends `console` and `3`), and `%s/api/nx/v%u/...`
+with the segment fixed. Same resources either way, which is why the adapter takes `console/v3`,
+`console/v2` and `nx/v2` on one dispatcher.
+
+| Path | Ours | Offset |
+| --- | --- | --- |
+| `network_service_accounts/%016llx/notification_tokens` | yes | 1458794 |
+| `save_data_archives?datatype=%hhu[&application_id=%016llx]` | yes | 1460216, 1463856 |
+| `save_data_archives/%llu` | yes | 1456337 |
+| `save_data_archives/start_upload[?force=true]` | yes (`force` ignored) | 1466565, 1460080 |
+| `save_data_archives/%llu/start_upload` | yes | 1464042 |
+| `save_data_archives/%llu/component_files/create` | yes | 1457180 |
+| `save_data_archives/%llu/extend_upload_timeout` | yes | 1466611 |
+| `save_data_archives/%llu/finish_upload` | yes | 1471075 |
+| `save_data_archives/%llu/start_download`, `/finish_download` | yes | 1475914, 1463926 |
+| `save_data_archives/%llu/generate_key_seed_package` | gated (M0) | 1471607 |
+| `save_data_archives/%llu/delete?force=true` | **yes, since 2026-09-16** | 1468615 |
+| `component_files/%llu/signed_uri`, `/update`, `/finish_upload` | yes | 1469557, 1479976, 1462612 |
+| `application_policy/%016llx/%05u?dtoken=` | yes | 1470372 |
+| `permissions` | **no** | 1470346 |
+| `save_data_sets`, `?update=true`, `?survey_request_id=%llu&repair_status=%s` | **no** | 1474085, 1460691, 1464913 |
+| `save_data_sets/generate_key_package` | **no** | 1456214 |
+| `customer_operations`, `?survey_request_id=%llu`, `/update_action_completed` | **no** | 1472350, 1469294, 1471465 |
+
+The `save_data_sets` and `customer_operations` families are save-data **repair** — the survey
+flow behind `SaveDataTransferManagerForSaveDataRepair` and the `migration`/`sata` hosts, not
+the backup this service implements. Note `save_data_sets/generate_key_package`: a *key
+package*, not a *key seed package*, and a different endpoint from the backup one.
+
+Bodies and fields F formats, beyond what N showed: `{"encoded_challenge": "%s"}` [1471579],
+`{"encoded_key_seed": "%s","encoded_mac": "%s"}` [1463995], `{"encoded_mac": "%s"}` [1479872],
+`{"encoded_sek":"%s","encoded_mac":"%s","mac_key_generation":%llu}` [1469395],
+`{"permissions": ["read"]}` [1480044] (the body of a `signed_uri` request),
+`{"save_data_archive_id":%llu,"nsa_id":"%016llx","save_data_type":"%s"}` [1463752]. Replies are
+read by path: `$.encoded_key_seed_package` [1456375], `$.format_version`, `$.component_file`,
+`$.revision`, `$.nsa_id`. The console also logs `x-nintendo-akamai-reference-id` [1479894].
+**Unexplained:** what `permissions` answers, what `save_data_type` and `$.revision` carry, and
+where `encoded_key_seed`/`encoded_sek` are sent — none of those are on a backup path we have
+watched.
 
 `start_upload` metadata, as sent by a console in N's replay: `datatype` (0), `data_size`,
 `saved_at_as_unixtime`, `launch_required_version`, `series_id`, `encoded_digest`, `desc`
@@ -107,6 +155,23 @@ bytes is the size of an RSA-4096 signature or ciphertext. If the package must be
 key in the console's firmware, no server can mint one and the answer is the same as News:
 a console-side key patch. That is milestone M0's question and nothing else is built on it
 until it is answered.
+
+**Where the answer is not (F, 2026-09-16).** `olsc` does not do this cryptography. It is a
+courier: it fetches the package over HTTP, reads it out as `$.encoded_key_seed_package`
+[1456375], and hands it to the filesystem service — `SetKeySeedPackage` [1473492],
+`GetKeySeed` [1460916], `GetInitialDataMacKeyGeneration` [1480208], through
+`nn::olsc::srv::adaptor::KeySeedPackageAdaptor` [1616276] onto
+`nn::fssrv::sf::ISaveDataTransferManagerForSaveDataRepair` [1502470] and
+`SaveDataTransferManagerVersion2` [1464317]. Whatever validates the package runs in **fs**,
+which lives in package2 and is not in the audit tree. Reading `olsc` further cannot answer
+M0; extracting fs is the next step, and it is the only one that can.
+
+**One thing worth chasing there (F, inference, not fact):** `olsc` also has
+`GetLocalKeySeedPackage` [1479304] — the console can produce a key seed package *itself*, for
+a transfer with no server in it. If the local package and the server package are the same
+shape, then the format is one a console mints, which is an argument against it being a
+Nintendo signature. If they are different shapes, that is the answer the other way. Either
+way it is a question about fs, not about this service.
 
 ## Policy
 

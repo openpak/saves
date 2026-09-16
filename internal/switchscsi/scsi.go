@@ -40,6 +40,11 @@ type Server struct {
 	Svc *service.Service
 	// AllowTitles, when non-empty, is the set of title ids whose policy is ALL_OK; empty allows all.
 	AllowTitles map[string]bool
+	// KeySeed answers generate_key_seed_package with random bytes of the documented size. It is
+	// off by default: nobody has minted one of these, the console's own key derivation happens
+	// in fs and not in olsc, and a console that acts on a package we invented is doing
+	// something no one has watched it do. Turn it on to run that experiment (M0).
+	KeySeed bool
 }
 
 func (s *Server) Register(mux *http.ServeMux) {
@@ -299,14 +304,24 @@ func (s *Server) archives(ctx context.Context, w http.ResponseWriter, r *http.Re
 		if !ok {
 			return
 		}
-		// M0: nobody outside Nintendo has minted one of these. The console gets fresh random
-		// bytes of the documented size, and the log records what it did next.
 		var in struct {
 			Challenge string `json:"encoded_challenge"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&in)
+		if !s.KeySeed {
+			log.Printf("[scsi] M0 key_seed_package archive=%d challenge=%q -> refused (SAVES_M0_KEY_SEED unset)", id, in.Challenge)
+			nintendoErr(w, http.StatusServiceUnavailable, "service_unavailable", "Not available", "this server does not mint key seed packages")
+			return
+		}
+		// The experiment: fresh random bytes of the documented size. The console derives its
+		// key in fs, not in olsc, so whether it accepts this is decided somewhere we cannot
+		// read — the log line below, and whether the archive is ever finished, is the answer.
 		pkg := make([]byte, 512)
 		_, _ = rand.Read(pkg)
+		if v != nil && v.Meta != nil {
+			v.Meta["key_seed_drawn"] = true
+			_ = s.Svc.Store.SetMeta(ctx, v.ID, v.Meta)
+		}
 		log.Printf("[scsi] M0 key_seed_package archive=%d challenge=%q -> random 512 bytes", id, in.Challenge)
 		out(w, 200, map[string]any{"encoded_key_seed_package": base64.RawURLEncoding.EncodeToString(pkg)})
 	case "start_upload":
@@ -377,8 +392,30 @@ func (s *Server) archives(ctx context.Context, w http.ResponseWriter, r *http.Re
 		for _, g := range gone {
 			s.Svc.DeleteBlobs(ctx, c.account, g)
 		}
+		if v.Meta["key_seed_drawn"] == true {
+			// M0 answered, in the only way it can be: the console took a package this server
+			// invented and finished the archive anyway.
+			log.Printf("[scsi] M0 ANSWER archive=%d finished after a server-minted key seed package, mac=%q", v.ID, in.MAC)
+		}
 		s.Svc.Store.Audit(ctx, c.account, "switch_upload", map[string]any{"title": sv.TitleID, "version": live.Number, "mac": in.MAC})
 		out(w, 200, map[string]any{"save_data_archive": s.archiveOf(live, sv, c, true)})
+	case "delete":
+		// The console deletes a backup from its own save-data cloud screen; ?force=true is
+		// what it sends. The archive goes, its bytes go with it unless another version was
+		// restored from them.
+		if !ok {
+			return
+		}
+		a := s.archiveOf(v, sv, c, true)
+		gone, err := s.Svc.Store.MarkDeleted(ctx, v.ID)
+		if err != nil {
+			nintendoErr(w, http.StatusInternalServerError, "internal_server_error", "Internal error", err.Error())
+			return
+		}
+		s.Svc.DeleteBlobs(ctx, c.account, *gone)
+		s.Svc.Store.Audit(ctx, c.account, "switch_delete", map[string]any{"title": sv.TitleID, "version": v.Number, "force": r.URL.Query().Get("force")})
+		log.Printf("[scsi] delete account=%s title=%s archive=%d force=%s", c.account, sv.TitleID, v.ID, r.URL.Query().Get("force"))
+		out(w, 200, map[string]any{"save_data_archive": a})
 	case "component_files":
 		if !ok {
 			return
