@@ -6,21 +6,20 @@ name: ci
 #
 # Runs on the OpenPak self-hosted runner for the same reason release.yml does: this repository
 # is private and GitHub-hosted minutes are metered. That runner has podman and no docker, so
-# Postgres is a container this job starts itself rather than a `services:` block.
+# Postgres is a container this job starts itself rather than a `services:` block — on a port
+# podman picks, because the runner is somebody's workstation and 23001 is often already a
+# test database of their own.
 on:
   push:
     branches: [main]
   pull_request:
 
-concurrency:
-  group: saves-ci # one at a time: the test Postgres takes a fixed port (ports.md 23001)
-
 jobs:
   test:
     runs-on: [self-hosted, linux, podman]
     env:
-      SAVES_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:23001/saves_test?sslmode=disable
-      SAVES_TEST_REQUIRE_DB: '1'
+      SAVES_TEST_REQUIRE_DB: '1' # a skipped database flow is a failure, not a green run
+      DB: saves-ci-${{ github.run_id }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -28,17 +27,18 @@ jobs:
           go-version: '1.26.x'
       - name: start postgres
         run: |
-          podman rm -f saves-ci-db 2>/dev/null || true
-          podman run -d --name saves-ci-db -e POSTGRES_PASSWORD=test -e POSTGRES_DB=saves_test \
-            -p 23001:5432 docker.io/library/postgres:18-alpine
+          podman run -d --name "$DB" -e POSTGRES_PASSWORD=test -e POSTGRES_DB=saves_test \
+            -p 127.0.0.1::5432 docker.io/library/postgres:18-alpine
+          port=$(podman port "$DB" 5432/tcp | head -1 | sed 's/.*://')
+          echo "SAVES_TEST_DATABASE_URL=postgres://postgres:test@127.0.0.1:$port/saves_test?sslmode=disable" >> "$GITHUB_ENV"
           for i in $(seq 30); do
-            podman exec saves-ci-db pg_isready -U postgres && exit 0
+            podman exec "$DB" pg_isready -U postgres && exit 0
             sleep 2
           done
-          echo "postgres never became ready"; podman logs saves-ci-db; exit 1
+          echo "postgres never became ready"; podman logs "$DB"; exit 1
       - run: go vet ./...
       - run: go test -race ./...
       - run: go build ./...
       - name: stop postgres
         if: always()
-        run: podman rm -f saves-ci-db || true
+        run: podman rm -f "$DB" || true

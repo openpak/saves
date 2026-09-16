@@ -16,10 +16,12 @@ permissions:
 jobs:
   image:
     runs-on: [self-hosted, linux, podman]
-    env:
-      REGISTRY_AUTH_FILE: ${{ runner.temp }}/auth.json # job-scoped login; never the runner user's own
     steps:
       - uses: actions/checkout@v4
+      # Job-scoped login, never the runner user's own. RUNNER_TEMP is read in a step because
+      # the runner context does not exist yet in a job-level env: block, and a workflow that
+      # names it there does not start at all.
+      - run: echo "REGISTRY_AUTH_FILE=$RUNNER_TEMP/auth.json" >> "$GITHUB_ENV"
       - run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
       - run: |
           set -e
