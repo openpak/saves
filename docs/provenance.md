@@ -56,6 +56,16 @@ JSON and wraps its object: `{"save_data_archive": {...}}`, `{"component_file": {
 | `POST component_files/<id>/update` | — | the component, `status: uploading`, with `put_url`, size and digest cleared | N |
 | `POST component_files/<id>/finish_upload` | `{"archive_size", "encoded_archive_digest"}` | the component, `status: fixed` | N |
 
+N answers the same resource set under both the `v2` and the `v3` prefix, and hands out
+`timeout_at_as_unixtime` of now+3600 on `GET save_data_archives/<id>` and on `start_download`,
+now+600 on `extend_upload_timeout` (N). It returns no structured error body at all: a bare 404
+for an unknown path, archive or component, and a 500 with plain text when a blob write fails
+(N). **Unexplained:** what the console shows for each, and whether it needs a body.
+
+There is no delete route in the set: N never removes an archive, and the console's own
+save-data cloud screen has no observed delete request. **Unexplained:** how a console asks for
+a backup to be forgotten, if it can at all.
+
 `start_upload` metadata, as sent by a console in N's replay: `datatype` (0), `data_size`,
 `saved_at_as_unixtime`, `launch_required_version`, `series_id`, `encoded_digest`, `desc`
 (null), `auto_backup`, `acd_index`. `application_id` was **absent** on a delta upload and
@@ -82,7 +92,11 @@ A **component file** is one blob of an archive:
 and transiently `get_url` / `put_url`.
 
 Blob URLs seen working: `https://<host>/<nsa>/<title>/<component id>_<index>.bin?Expires=..`
-(N). The console PUTs the body raw and GETs it raw, `application/octet-stream`.
+(N), served for GET on the download host and PUT on the upload host, with no bearer. The
+console PUTs the body raw and GETs it raw, `application/octet-stream`. That path shape is N's
+own choice, not the console's requirement: Nintendo's `put_url` is an S3 presigned URL on
+`amazonaws.com` (K), so the console follows whatever URL the archive hands it. OpenPak mints
+`/blob/<part id>?exp&sig` on the same two hosts.
 
 **Unexplained, and the risk that decides the design:** the console encrypts each component
 before upload. `generate_key_seed_package` answers a 16-byte challenge with a 512-byte

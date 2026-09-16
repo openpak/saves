@@ -151,12 +151,12 @@ func (s *Server) putSave(w http.ResponseWriter, r *http.Request) {
 	if b, err := strconv.Atoi(r.URL.Query().Get("base")); err == nil && b > 0 {
 		base = &b
 	}
-	name, backend, err := s.Svc.BackendFor(ctx, account)
+	loc, backend, err := s.Svc.BackendFor(ctx, account)
 	if err != nil {
 		failWith(w, err)
 		return
 	}
-	if err := s.Svc.CheckAllowance(ctx, account, name, r.ContentLength); err != nil {
+	if err := s.Svc.CheckAllowance(ctx, account, loc.Backend, r.ContentLength); err != nil {
 		failWith(w, err)
 		return
 	}
@@ -165,7 +165,11 @@ func (s *Server) putSave(w http.ResponseWriter, r *http.Request) {
 		failWith(w, err)
 		return
 	}
-	v, err := s.Svc.Store.NewVersion(ctx, sv.ID, base, r.URL.Query().Get("device"), name, nil, r.ContentLength, nil, 0)
+	declared := r.ContentLength
+	if declared < 0 {
+		declared = 0 // chunked: nothing to reserve, the write itself is checked below
+	}
+	v, err := s.Svc.Store.NewVersion(ctx, sv.ID, base, r.URL.Query().Get("device"), loc, nil, declared, nil, 0, s.Svc.Quota(loc.Backend))
 	if err != nil {
 		failWith(w, err)
 		return
@@ -181,9 +185,9 @@ func (s *Server) putSave(w http.ResponseWriter, r *http.Request) {
 		failWith(w, err)
 		return
 	}
-	if name == blob.Local {
+	if loc.Backend == blob.Local {
 		// The content length was the promise; the bytes are the fact.
-		if err := s.Svc.CheckAllowance(ctx, account, name, n); err != nil {
+		if err := s.Svc.CheckAllowance(ctx, account, loc.Backend, n); err != nil {
 			_ = backend.Delete(ctx, p.Key)
 			_, _ = s.Svc.Store.MarkDeleted(ctx, v.ID)
 			failWith(w, err)
@@ -267,7 +271,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, account string, 
 		jsonErr(w, http.StatusConflict, "this version has several parts; download is not available for console backups yet")
 		return
 	}
-	b, err := s.Svc.BackendNamed(r.Context(), account, v.Backend)
+	b, err := s.Svc.BackendAt(r.Context(), account, v.Loc())
 	if err != nil {
 		failWith(w, err)
 		return

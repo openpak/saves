@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS versions (
 	sha256      text NOT NULL DEFAULT '',
 	device      text NOT NULL DEFAULT '',
 	backend     text NOT NULL,
+	location    text NOT NULL DEFAULT '',
 	meta        jsonb NOT NULL DEFAULT '{}',
 	saved_at    timestamptz,
 	created_at  timestamptz NOT NULL DEFAULT now(),
@@ -42,6 +43,7 @@ CREATE TABLE IF NOT EXISTS versions (
 	timeout_at  timestamptz,
 	UNIQUE (save_id, number)
 );
+ALTER TABLE versions ADD COLUMN IF NOT EXISTS location text NOT NULL DEFAULT '';
 CREATE TABLE IF NOT EXISTS parts (
 	id         bigserial PRIMARY KEY,
 	version_id bigint NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
@@ -87,6 +89,11 @@ const (
 
 var ErrNotFound = errors.New("not found")
 
+// Location is where a version's bytes were written: the kind of backend, and the identity of
+// that destination (blob.Config.LocationID). Both are recorded on the version, because the
+// account's settings are a moving target and a stored backup is not.
+type Location struct{ Backend, ID string }
+
 // ErrQuota is returned with the numbers the player needs to see.
 type ErrQuota struct{ Used, Limit, Wanted int64 }
 
@@ -114,6 +121,7 @@ type Version struct {
 	SHA256     string
 	Device     string
 	Backend    string
+	Location   string
 	Meta       map[string]any
 	SavedAt    *time.Time
 	CreatedAt  time.Time
@@ -121,6 +129,9 @@ type Version struct {
 	TimeoutAt  *time.Time
 	Parts      []Part
 }
+
+// Loc is where this version's bytes are, as the service needs it to open a backend.
+func (v Version) Loc() Location { return Location{Backend: v.Backend, ID: v.Location} }
 
 type Part struct {
 	ID        int64
@@ -200,18 +211,35 @@ func (s *Store) SaveOf(ctx context.Context, account, platform, title string) (*S
 
 // NewVersion opens the next version of a save in status uploading. base is the version the
 // client loaded from, or nil; if a newer one already exists the new version is flagged conflict
-// (CS-02) rather than refused.
-func (s *Store) NewVersion(ctx context.Context, saveID int64, base *int, device, backend string, meta map[string]any, size int64, savedAt *time.Time, timeout time.Duration) (*Version, error) {
+// (CS-02) rather than refused. quota, when positive, is the bytes this backend allows the
+// account: the uploading row is the reservation, so a second upload cannot spend the same
+// space, and an abandoned one releases it when the sweep retires it.
+func (s *Store) NewVersion(ctx context.Context, saveID int64, base *int, device string, loc Location, meta map[string]any, size int64, savedAt *time.Time, timeout time.Duration, quota int64) (*Version, error) {
 	if meta == nil {
 		meta = map[string]any{}
 	}
 	mj, _ := json.Marshal(meta)
-	v := &Version{SaveID: saveID, BaseNumber: base, Status: Uploading, Device: device, Backend: backend, Meta: meta, Size: size, SavedAt: savedAt}
+	v := &Version{SaveID: saveID, BaseNumber: base, Status: Uploading, Device: device, Backend: loc.Backend, Location: loc.ID, Meta: meta, Size: size, SavedAt: savedAt}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
+	// ponytail: one advisory lock per account serialises numbering and the reservation
+	// together; split it per save if one account's uploads ever contend.
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext(account_id)::bigint) FROM saves WHERE id=$1`, saveID); err != nil {
+		return nil, err
+	}
+	if quota > 0 {
+		var used int64
+		if err := tx.QueryRowContext(ctx, `SELECT coalesce(sum(v.size),0) FROM versions v JOIN saves s ON s.id=v.save_id
+			WHERE s.account_id=(SELECT account_id FROM saves WHERE id=$1) AND v.backend=$2 AND v.status IN ('live','uploading')`, saveID, loc.Backend).Scan(&used); err != nil {
+			return nil, err
+		}
+		if used+size > quota {
+			return nil, ErrQuota{Used: used, Limit: quota, Wanted: size}
+		}
+	}
 	var maxLive sql.NullInt64
 	if err := tx.QueryRowContext(ctx, `SELECT max(number) FROM versions WHERE save_id=$1 AND status='live'`, saveID).Scan(&maxLive); err != nil {
 		return nil, err
@@ -225,9 +253,9 @@ func (s *Store) NewVersion(ctx context.Context, saveID int64, base *int, device,
 		t := time.Now().Add(timeout)
 		to = &t
 	}
-	err = tx.QueryRowContext(ctx, `INSERT INTO versions (save_id, number, base_number, status, conflict, size, device, backend, meta, saved_at, timeout_at)
-		VALUES ($1,$2,$3,'uploading',$4,$5,$6,$7,$8,$9,$10) RETURNING id, created_at, timeout_at`,
-		saveID, v.Number, base, v.Conflict, size, device, backend, mj, savedAt, to).Scan(&v.ID, &v.CreatedAt, &v.TimeoutAt)
+	err = tx.QueryRowContext(ctx, `INSERT INTO versions (save_id, number, base_number, status, conflict, size, device, backend, location, meta, saved_at, timeout_at)
+		VALUES ($1,$2,$3,'uploading',$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id, created_at, timeout_at`,
+		saveID, v.Number, base, v.Conflict, size, device, loc.Backend, loc.ID, mj, savedAt, to).Scan(&v.ID, &v.CreatedAt, &v.TimeoutAt)
 	if err != nil {
 		return nil, err
 	}
@@ -299,7 +327,10 @@ func (s *Store) Versions(ctx context.Context, saveID int64, all bool) ([]Version
 	return vs, nil
 }
 
-// Newest is the current live version of a save, or ErrNotFound.
+// Newest is the current live version of a save, or ErrNotFound: the newest live version that
+// is not a conflict, because a conflict is a divergence waiting for the player and not the
+// progress to hand the next device. If every live version is a conflict, the newest of them is
+// still the best answer there is.
 func (s *Store) Newest(ctx context.Context, saveID int64) (*Version, error) {
 	vs, err := s.Versions(ctx, saveID, false)
 	if err != nil {
@@ -308,10 +339,15 @@ func (s *Store) Newest(ctx context.Context, saveID int64) (*Version, error) {
 	if len(vs) == 0 {
 		return nil, ErrNotFound
 	}
+	for i := range vs {
+		if !vs[i].Conflict {
+			return &vs[i], nil
+		}
+	}
 	return &vs[0], nil
 }
 
-const versionSelect = `SELECT v.id, v.save_id, v.number, v.base_number, v.status, v.conflict, v.pinned, v.size, v.sha256, v.device, v.backend, v.meta, v.saved_at, v.created_at, v.finished_at, v.timeout_at FROM versions v`
+const versionSelect = `SELECT v.id, v.save_id, v.number, v.base_number, v.status, v.conflict, v.pinned, v.size, v.sha256, v.device, v.backend, v.location, v.meta, v.saved_at, v.created_at, v.finished_at, v.timeout_at FROM versions v`
 
 func scanVersions(rows *sql.Rows) ([]Version, error) {
 	defer rows.Close()
@@ -320,7 +356,7 @@ func scanVersions(rows *sql.Rows) ([]Version, error) {
 		var v Version
 		var base sql.NullInt64
 		var mj []byte
-		if err := rows.Scan(&v.ID, &v.SaveID, &v.Number, &base, &v.Status, &v.Conflict, &v.Pinned, &v.Size, &v.SHA256, &v.Device, &v.Backend, &mj, &v.SavedAt, &v.CreatedAt, &v.FinishedAt, &v.TimeoutAt); err != nil {
+		if err := rows.Scan(&v.ID, &v.SaveID, &v.Number, &base, &v.Status, &v.Conflict, &v.Pinned, &v.Size, &v.SHA256, &v.Device, &v.Backend, &v.Location, &mj, &v.SavedAt, &v.CreatedAt, &v.FinishedAt, &v.TimeoutAt); err != nil {
 			return nil, err
 		}
 		if base.Valid {
@@ -362,12 +398,21 @@ func (s *Store) Finish(ctx context.Context, id int64, sha256 string) (*Version, 
 		return nil, nil, err
 	}
 	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext(s.account_id)::bigint) FROM versions v JOIN saves s ON s.id=v.save_id WHERE v.id=$1`, id); err != nil {
+		return nil, nil, err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM parts WHERE version_id=$1 AND status<>'fixed'`, id); err != nil {
 		return nil, nil, err
 	}
+	// The base is checked again here, not only when the upload opened: two devices that both
+	// start from version 1 are neither of them stale at the start and both of them are by the
+	// time the second commits. A client that declares no base keeps newest-wins.
 	var saveID int64
-	if err := tx.QueryRowContext(ctx, `UPDATE versions SET status='live', finished_at=now(), timeout_at=NULL, sha256=$2,
-		size=(SELECT coalesce(sum(size),0) FROM parts WHERE version_id=$1) WHERE id=$1 RETURNING save_id`, id, sha256).Scan(&saveID); err != nil {
+	if err := tx.QueryRowContext(ctx, `UPDATE versions v SET status='live', finished_at=now(), timeout_at=NULL, sha256=$2,
+		size=(SELECT coalesce(sum(size),0) FROM parts WHERE version_id=$1),
+		conflict = v.conflict OR (v.base_number IS NOT NULL AND EXISTS (
+			SELECT 1 FROM versions o WHERE o.save_id=v.save_id AND o.id<>v.id AND o.status='live' AND o.number > v.base_number))
+		WHERE v.id=$1 RETURNING v.save_id`, id, sha256).Scan(&saveID); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil, ErrNotFound
 		}
@@ -434,9 +479,10 @@ func (s *Store) Restore(ctx context.Context, id int64) error {
 	return err
 }
 
-// SetBackend records that a version's parts now live in another backend under new keys.
-func (s *Store) SetBackend(ctx context.Context, versionID int64, backend string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE versions SET backend=$2 WHERE id=$1`, versionID, backend)
+// SetLocation records that a version's parts now live somewhere else: the move is what makes
+// this true, so it is written only after the copy is verified.
+func (s *Store) SetLocation(ctx context.Context, versionID int64, loc Location) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE versions SET backend=$2, location=$3 WHERE id=$1`, versionID, loc.Backend, loc.ID)
 	return err
 }
 
@@ -468,6 +514,25 @@ func (s *Store) LiveVersions(ctx context.Context, account, backend string) ([]Ve
 // Expired lists uploading versions whose timeout passed; the sweep abandons them.
 func (s *Store) Expired(ctx context.Context) ([]Version, error) {
 	rows, err := s.db.QueryContext(ctx, versionSelect+` WHERE v.status='uploading' AND v.timeout_at < now()`)
+	if err != nil {
+		return nil, err
+	}
+	vs, err := scanVersions(rows)
+	if err != nil {
+		return nil, err
+	}
+	for i := range vs {
+		if _, err := s.withParts(ctx, &vs[i]); err != nil {
+			return nil, err
+		}
+	}
+	return vs, nil
+}
+
+// Tombstones lists versions that are deleted in the index but whose blobs are still there,
+// so the sweep can retry what a broken backend refused.
+func (s *Store) Tombstones(ctx context.Context, limit int) ([]Version, error) {
+	rows, err := s.db.QueryContext(ctx, versionSelect+` WHERE v.status='deleted' ORDER BY v.id LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
 	}

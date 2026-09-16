@@ -33,39 +33,46 @@ type Service struct {
 	UploadHost, DownloadHost string
 }
 
-// BackendFor is the backend an account writes new versions to: its own storage when it has
-// connected some, else the allowance. The name is what the version row records.
-func (s *Service) BackendFor(ctx context.Context, account string) (string, blob.Backend, error) {
+// BackendFor is where an account writes new versions: its own storage when it has connected
+// some, else the allowance. The location it returns is what the version row records.
+func (s *Service) BackendFor(ctx context.Context, account string) (store.Location, blob.Backend, error) {
+	local := store.Location{Backend: blob.Local, ID: blob.Local}
 	st, err := s.Store.Settings(ctx, account)
 	if errors.Is(err, store.ErrNotFound) {
-		return blob.Local, s.Local, nil
+		return local, s.Local, nil
 	}
 	if err != nil {
-		return "", nil, err
+		return store.Location{}, nil, err
 	}
-	b, err := s.openSettings(st)
+	cfg, err := blob.OpenConfig(s.CredentialKey, st.Config)
 	if err != nil {
-		return "", nil, err
+		return store.Location{}, nil, err
 	}
-	return st.Kind, b, nil
+	b, err := blob.NewBackend(cfg, s.Providers)
+	if err != nil {
+		return store.Location{}, nil, err
+	}
+	return store.Location{Backend: st.Kind, ID: cfg.LocationID()}, b, nil
 }
 
-// BackendNamed opens the backend a stored version says it lives in.
-func (s *Service) BackendNamed(ctx context.Context, account, name string) (blob.Backend, error) {
-	if name == blob.Local {
+// BackendAt opens the storage a stored version was written to. If the account has since
+// pointed at a different bucket, share or drive, this refuses: the bytes are in the old place,
+// and both reading and deleting the new one would be wrong. Versions written before locations
+// were recorded carry no id and are taken at their word.
+func (s *Service) BackendAt(ctx context.Context, account string, loc store.Location) (blob.Backend, error) {
+	if loc.Backend == blob.Local {
 		return s.Local, nil
 	}
 	st, err := s.Store.Settings(ctx, account)
 	if err != nil {
 		return nil, fmt.Errorf("this version lives in storage that is no longer connected")
 	}
-	return s.openSettings(st)
-}
-
-func (s *Service) openSettings(st *store.Settings) (blob.Backend, error) {
 	cfg, err := blob.OpenConfig(s.CredentialKey, st.Config)
 	if err != nil {
 		return nil, err
+	}
+	if loc.ID != "" && cfg.LocationID() != loc.ID {
+		return nil, fmt.Errorf("this version lives in %s, and the connected storage is %s: reconnect that storage to reach it", loc.ID, cfg.LocationID())
 	}
 	return blob.NewBackend(cfg, s.Providers)
 }
@@ -94,7 +101,7 @@ func Key(account, platform, title string, versionID int64, idx int) string {
 // DeleteBlobs removes every part of a version from its backend and forgets the row. Failures
 // are logged and the row stays deleted-but-present so a later sweep can retry.
 func (s *Service) DeleteBlobs(ctx context.Context, account string, v store.Version) {
-	b, err := s.BackendNamed(ctx, account, v.Backend)
+	b, err := s.BackendAt(ctx, account, v.Loc())
 	if err != nil {
 		log.Printf("[saves] version %d: backend unavailable, blobs kept: %v", v.ID, err)
 		return
@@ -118,12 +125,12 @@ func (s *Service) Move(account string) {
 		log.Printf("[saves] move %s: %v", account, err)
 		_ = s.Store.SetMoveState(ctx, account, "failed: "+err.Error())
 	}
-	name, dst, err := s.BackendFor(ctx, account)
+	dstLoc, dst, err := s.BackendFor(ctx, account)
 	if err != nil {
 		fail(err)
 		return
 	}
-	if name == blob.Local {
+	if dstLoc.Backend == blob.Local {
 		fail(errors.New("no storage connected"))
 		return
 	}
@@ -150,7 +157,7 @@ func (s *Service) Move(account string) {
 				return
 			}
 		}
-		if err := s.Store.SetBackend(ctx, v.ID, name); err != nil {
+		if err := s.Store.SetLocation(ctx, v.ID, dstLoc); err != nil {
 			fail(err)
 			return
 		}
@@ -162,7 +169,18 @@ func (s *Service) Move(account string) {
 	_ = s.Store.SetMoveState(ctx, account, fmt.Sprintf("done: %d versions", len(vs)))
 }
 
-// Sweep abandons uploads that timed out.
+// Quota is the limit NewVersion reserves against: the allowance on the hosted backend, and
+// nothing on the player's own storage.
+func (s *Service) Quota(backend string) int64 {
+	if backend == blob.Local {
+		return s.Allowance
+	}
+	return 0
+}
+
+// Sweep abandons uploads that timed out, then retries the deletions that failed: a backend
+// that was unreachable when a version was retired leaves a tombstone, and nothing else ever
+// comes back for it.
 func (s *Service) Sweep(ctx context.Context) {
 	vs, err := s.Store.Expired(ctx)
 	if err != nil {
@@ -175,6 +193,14 @@ func (s *Service) Sweep(ctx context.Context) {
 			acct := strings.SplitN(firstKey(v), "/", 2)[0]
 			s.DeleteBlobs(ctx, acct, v)
 		}
+	}
+	dead, err := s.Store.Tombstones(ctx, 200)
+	if err != nil {
+		log.Printf("[saves] sweep tombstones: %v", err)
+		return
+	}
+	for _, v := range dead {
+		s.DeleteBlobs(ctx, strings.SplitN(firstKey(v), "/", 2)[0], v)
 	}
 }
 

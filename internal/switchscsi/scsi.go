@@ -44,6 +44,10 @@ type Server struct {
 
 func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/scsi/api/console/v3/", s.storage)
+	// Older firmware calls /api/nx/v2 (K); nx-scsi answers v2 as well as v3. Same resources,
+	// so one dispatcher takes every prefix (docs/provenance.md).
+	mux.HandleFunc("/scsi/api/console/v2/", s.storage)
+	mux.HandleFunc("/scsi/api/nx/v2/", s.storage)
 	mux.HandleFunc("GET /scsi/api/console/v2/application_policy/{title}/{version}", s.policy)
 	mux.HandleFunc("PUT /scsi/blob/{part}", s.putBlob)
 	mux.HandleFunc("GET /scsi/blob/{part}", s.getBlob)
@@ -58,6 +62,21 @@ func out(w http.ResponseWriter, code int, v any) {
 // nintendoErr is the error shape the console reads (the adapter uses the same one).
 func nintendoErr(w http.ResponseWriter, code int, kind, title, detail string) {
 	out(w, code, map[string]any{"errorCode": kind, "title": title, "detail": detail, "status": code})
+}
+
+// mustPost refuses anything but POST on the action routes: an upload URL or a stray GET must
+// not be able to fix an archive.
+func mustPost(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method == http.MethodPost {
+		return true
+	}
+	nintendoErr(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed", r.Method+" is not allowed here")
+	return false
+}
+
+// notFixed answers the console when it asks for a state change the archive cannot make.
+func notFixed(w http.ResponseWriter, detail string) {
+	nintendoErr(w, http.StatusConflict, "invalid_state", "Archive state does not allow this", detail)
 }
 
 type caller struct{ account, nsa, device string }
@@ -188,7 +207,7 @@ func (s *Server) archiveOf(v *store.Version, sv *store.Save, c caller, withParts
 		a.TimeoutAt = v.TimeoutAt.Unix()
 	}
 	for _, p := range v.Parts {
-		if p.Kind == "save" && p.Status == store.Fixed {
+		if p.Kind == "save" {
 			a.NumOfPartitions++
 		}
 		if withParts {
@@ -200,16 +219,29 @@ func (s *Server) archiveOf(v *store.Version, sv *store.Save, c caller, withParts
 
 // ---- routing ----
 
+// resourcePath is everything after the API version segment, whichever prefix carried it.
+func resourcePath(p string) string {
+	for _, v := range []string{"/v3/", "/v2/"} {
+		if i := strings.Index(p, v); i >= 0 {
+			return p[i+len(v):]
+		}
+	}
+	return ""
+}
+
 func (s *Server) storage(w http.ResponseWriter, r *http.Request) {
 	c, ok := callerOf(r)
 	if !ok {
 		nintendoErr(w, http.StatusUnauthorized, "invalid_token", "Unauthorized", "The token is not valid")
 		return
 	}
-	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/scsi/api/console/v3/"), "/"), "/")
+	parts := strings.Split(strings.Trim(resourcePath(r.URL.Path), "/"), "/")
 	ctx := r.Context()
 	switch parts[0] {
 	case "network_service_accounts":
+		if !mustPost(w, r) {
+			return
+		}
 		// .../<nsa>/notification_tokens: echoed back, as documented.
 		var in struct {
 			Token string `json:"notification_token"`
@@ -232,6 +264,9 @@ func (s *Server) archives(ctx context.Context, w http.ResponseWriter, r *http.Re
 		return
 	}
 	if rest[0] == "start_upload" {
+		if !mustPost(w, r) {
+			return
+		}
 		s.startUpload(ctx, w, r, c, nil)
 		return
 	}
@@ -245,6 +280,10 @@ func (s *Server) archives(ctx context.Context, w http.ResponseWriter, r *http.Re
 		if !ok {
 			return
 		}
+		if r.Method != http.MethodGet {
+			nintendoErr(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed", r.Method+" is not allowed here")
+			return
+		}
 		a := s.archiveOf(v, sv, c, true)
 		if v.Status == store.Uploading {
 			s.attachPutURLs(ctx, a, v, c)
@@ -252,8 +291,14 @@ func (s *Server) archives(ctx context.Context, w http.ResponseWriter, r *http.Re
 		out(w, 200, map[string]any{"save_data_archive": a})
 		return
 	}
+	if !mustPost(w, r) {
+		return
+	}
 	switch rest[1] {
 	case "generate_key_seed_package":
+		if !ok {
+			return
+		}
 		// M0: nobody outside Nintendo has minted one of these. The console gets fresh random
 		// bytes of the documented size, and the log records what it did next.
 		var in struct {
@@ -273,8 +318,12 @@ func (s *Server) archives(ctx context.Context, w http.ResponseWriter, r *http.Re
 		if !ok {
 			return
 		}
+		if v.Status != store.Live {
+			notFixed(w, "this archive is still uploading")
+			return
+		}
 		a := s.archiveOf(v, sv, c, true)
-		b, err := s.Svc.BackendNamed(ctx, c.account, v.Backend)
+		b, err := s.Svc.BackendAt(ctx, c.account, v.Loc())
 		if err != nil {
 			nintendoErr(w, http.StatusBadGateway, "storage_unavailable", "Storage unavailable", err.Error())
 			return
@@ -299,6 +348,10 @@ func (s *Server) archives(ctx context.Context, w http.ResponseWriter, r *http.Re
 		if !ok {
 			return
 		}
+		if v.Status != store.Uploading {
+			notFixed(w, "this archive is already fixed")
+			return
+		}
 		_ = s.Svc.Store.ExtendTimeout(ctx, v.ID, uploadWindow)
 		v, _ = s.Svc.Store.Version(ctx, v.ID)
 		out(w, 200, map[string]any{"save_data_archive": s.archiveOf(v, sv, c, true)})
@@ -310,6 +363,12 @@ func (s *Server) archives(ctx context.Context, w http.ResponseWriter, r *http.Re
 			MAC string `json:"encoded_mac"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&in)
+		if v.Status != store.Uploading {
+			// A retried finish answers with the archive it already fixed instead of running
+			// retention, and dropping parts, a second time.
+			out(w, 200, map[string]any{"save_data_archive": s.archiveOf(v, sv, c, true)})
+			return
+		}
 		live, gone, err := s.Svc.Store.Finish(ctx, v.ID, "")
 		if err != nil {
 			nintendoErr(w, http.StatusInternalServerError, "internal_server_error", "Internal error", err.Error())
@@ -325,6 +384,10 @@ func (s *Server) archives(ctx context.Context, w http.ResponseWriter, r *http.Re
 			return
 		}
 		if len(rest) >= 3 && rest[2] == "create" {
+			if v.Status != store.Uploading {
+				notFixed(w, "a fixed archive takes no new components")
+				return
+			}
 			s.createComponent(ctx, w, r, c, v, sv)
 			return
 		}
@@ -417,18 +480,9 @@ func (s *Server) startUpload(ctx context.Context, w http.ResponseWriter, r *http
 		nintendoErr(w, http.StatusBadRequest, "invalid_parameter", "Invalid parameter", "application_id is required")
 		return
 	}
-	name, _, err := s.Svc.BackendFor(ctx, c.account)
+	loc, _, err := s.Svc.BackendFor(ctx, c.account)
 	if err != nil {
 		nintendoErr(w, http.StatusBadGateway, "storage_unavailable", "Storage unavailable", err.Error())
-		return
-	}
-	if err := s.Svc.CheckAllowance(ctx, c.account, name, in.DataSize); err != nil {
-		var q store.ErrQuota
-		if errors.As(err, &q) {
-			nintendoErr(w, http.StatusForbidden, "storage_quota_exceeded", "Not enough space", fmt.Sprintf("%d of %d bytes used; connect your own storage on openpak.org", q.Used, q.Limit))
-			return
-		}
-		nintendoErr(w, http.StatusInternalServerError, "internal_server_error", "Internal error", err.Error())
 		return
 	}
 	sv, err := s.Svc.Store.EnsureSave(ctx, c.account, Platform, title)
@@ -449,15 +503,27 @@ func (s *Server) startUpload(ctx context.Context, w http.ResponseWriter, r *http
 		}
 	}
 	savedAt := time.Unix(in.SavedAt, 0)
-	v, err := s.Svc.Store.NewVersion(ctx, sv.ID, base, c.device, name, meta, in.DataSize, &savedAt, uploadWindow)
+	// The uploading version is the allowance reservation: the console's declared data_size is
+	// held until it commits or the sweep takes it back.
+	v, err := s.Svc.Store.NewVersion(ctx, sv.ID, base, c.device, loc, meta, in.DataSize, &savedAt, uploadWindow, s.Svc.Quota(loc.Backend))
 	if err != nil {
+		var q store.ErrQuota
+		if errors.As(err, &q) {
+			nintendoErr(w, http.StatusForbidden, "storage_quota_exceeded", "Not enough space", fmt.Sprintf("%d of %d bytes used; connect your own storage on openpak.org", q.Used, q.Limit))
+			return
+		}
 		nintendoErr(w, http.StatusInternalServerError, "internal_server_error", "Internal error", err.Error())
 		return
 	}
 	// Components: mirror the previous archive's set, or start with meta alone.
 	shape := []store.Part{{Index: metaIndex, Kind: "meta"}}
-	if prev != nil && len(prev.Parts) > 0 {
-		shape = prev.Parts
+	if prev != nil {
+		for _, p := range prev.Parts {
+			if p.Status == store.Fixed {
+				shape = append(shape[:0], prev.Parts...)
+				break
+			}
+		}
 	}
 	for _, p := range shape {
 		if _, err := s.Svc.Store.AddPart(ctx, v.ID, p.Index, p.Kind, service.Key(c.account, Platform, title, v.ID, p.Index)); err != nil {
@@ -477,7 +543,7 @@ func (s *Server) startUpload(ctx context.Context, w http.ResponseWriter, r *http
 			}
 		}
 	}
-	log.Printf("[scsi] start_upload account=%s title=%s version=%d backend=%s parts=%d conflict=%v", c.account, title, v.Number, name, len(v.Parts), v.Conflict)
+	log.Printf("[scsi] start_upload account=%s title=%s version=%d backend=%s parts=%d conflict=%v", c.account, title, v.Number, loc.Backend, len(v.Parts), v.Conflict)
 	out(w, http.StatusCreated, map[string]any{"save_data_archive": a})
 }
 
@@ -513,13 +579,20 @@ func (s *Server) components(ctx context.Context, w http.ResponseWriter, r *http.
 		nintendoErr(w, http.StatusNotFound, "resource_is_not_found", "Specified resource is not found", "Resource is not found")
 		return
 	}
+	if !mustPost(w, r) {
+		return
+	}
 	v, _, ok := s.owned(ctx, w, c, p.VersionID)
 	if !ok {
 		return
 	}
+	if rest[1] != "signed_uri" && v.Status != store.Uploading {
+		notFixed(w, "a fixed archive's components cannot change")
+		return
+	}
 	switch rest[1] {
 	case "signed_uri":
-		b, err := s.Svc.BackendNamed(ctx, c.account, v.Backend)
+		b, err := s.Svc.BackendAt(ctx, c.account, v.Loc())
 		if err != nil {
 			nintendoErr(w, http.StatusBadGateway, "storage_unavailable", "Storage unavailable", err.Error())
 			return
@@ -542,7 +615,7 @@ func (s *Server) components(ctx context.Context, w http.ResponseWriter, r *http.
 		_ = json.NewDecoder(r.Body).Decode(&in)
 		// The bytes are the fact: a part whose stored size disagrees with the console's
 		// claim is not fixed, and the console will retry or abandon the archive.
-		b, err := s.Svc.BackendNamed(ctx, c.account, v.Backend)
+		b, err := s.Svc.BackendAt(ctx, c.account, v.Loc())
 		if err != nil {
 			nintendoErr(w, http.StatusBadGateway, "storage_unavailable", "Storage unavailable", err.Error())
 			return
@@ -564,7 +637,7 @@ func (s *Server) components(ctx context.Context, w http.ResponseWriter, r *http.
 // putURL and getURL are where the bytes go and come from: the player's own bucket when it
 // presigns, else the allowance blob hosts with an OpenPak-signed URL.
 func (s *Server) putURL(ctx context.Context, c caller, v *store.Version, p *store.Part) string {
-	if b, err := s.Svc.BackendNamed(ctx, c.account, v.Backend); err == nil {
+	if b, err := s.Svc.BackendAt(ctx, c.account, v.Loc()); err == nil {
 		if ps, ok := b.(blob.Presigner); ok {
 			if u, err := ps.PresignPut(ctx, p.Key, urlTTL); err == nil {
 				return u
@@ -619,19 +692,62 @@ func (s *Server) blobPart(w http.ResponseWriter, r *http.Request) (*store.Part, 
 	return p, true
 }
 
+// blobBackend is the storage the part's version was written to. These hosts serve every
+// backend that cannot presign, so the bytes must reach that backend and not the allowance.
+// The account is the first segment of every part key (service.Key).
+func (s *Server) blobBackend(r *http.Request, p *store.Part) (blob.Backend, *store.Version, string, error) {
+	v, err := s.Svc.Store.Version(r.Context(), p.VersionID)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	acct := strings.SplitN(p.Key, "/", 2)[0]
+	b, err := s.Svc.BackendAt(r.Context(), acct, v.Loc())
+	return b, v, acct, err
+}
+
 func (s *Server) putBlob(w http.ResponseWriter, r *http.Request) {
 	p, ok := s.blobPart(w, r)
 	if !ok {
 		return
 	}
-	n, digest, err := s.Svc.PutPart(r.Context(), s.Svc.Local, p, r.Body, r.ContentLength)
+	ctx := r.Context()
+	b, v, acct, err := s.blobBackend(r, p)
+	if err != nil {
+		log.Printf("[scsi] blob put part=%d: %v", p.ID, err)
+		http.Error(w, "storage unavailable", http.StatusBadGateway)
+		return
+	}
+	if v.Status != store.Uploading {
+		// The signed URL outlives the upload; a fixed archive's bytes are not rewritable.
+		http.Error(w, "archive is fixed", http.StatusConflict)
+		return
+	}
+	body, room := io.Reader(r.Body), int64(-1)
+	if v.Backend == blob.Local {
+		used, _, err := s.Svc.Store.Usage(ctx, acct, blob.Local)
+		if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		// ponytail: a per-request cap, not a reservation across in-flight uploads; the
+		// reservation is C1's job. This is what stops one console filling the disk.
+		room = s.Svc.Allowance - used
+		body = io.LimitReader(body, room+1)
+	}
+	n, digest, err := s.Svc.PutPart(ctx, b, p, body, r.ContentLength)
 	if err != nil {
 		log.Printf("[scsi] blob put part=%d: %v", p.ID, err)
 		http.Error(w, "write failed", http.StatusInternalServerError)
 		return
 	}
+	if room >= 0 && n > room {
+		_ = b.Delete(ctx, p.Key)
+		log.Printf("[scsi] blob put part=%d: %d bytes over the %d left of the allowance", p.ID, n-room, room)
+		http.Error(w, "allowance exceeded", http.StatusForbidden)
+		return
+	}
 	// The console's own finish_upload sets the digest it computed; ours goes in meanwhile.
-	_ = s.Svc.Store.SetPartStatus(r.Context(), p.ID, "uploading", &n, "sha256:"+digest)
+	_ = s.Svc.Store.SetPartStatus(ctx, p.ID, "uploading", &n, "sha256:"+digest)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -640,7 +756,12 @@ func (s *Server) getBlob(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rc, size, err := s.Svc.Local.Get(r.Context(), p.Key)
+	b, _, _, err := s.blobBackend(r, p)
+	if err != nil {
+		http.Error(w, "storage unavailable", http.StatusBadGateway)
+		return
+	}
+	rc, size, err := b.Get(r.Context(), p.Key)
 	if err != nil {
 		http.NotFound(w, r)
 		return

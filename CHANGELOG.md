@@ -5,6 +5,12 @@ of truth; this file is the readable summary.
 
 ## Unreleased
 
+- scsi: v2 and v3 prefixes, POST-only actions, and a fixed archive that stays fixed
+- the allowance is reserved by the upload, not recomputed after it
+- a stale upload is a conflict at commit, and a conflict is never the current version
+- the sweep retries deletions a backend refused
+- every version records the storage location it was written to; changing storage no longer moves old backups
+- ci: vet, race tests and a Postgres that a skip cannot hide
 - release: job-scoped registry auth file [989d4b7]
 - release: build on the self-hosted runner with podman; private-repo minutes are metered [1f2bc15]
 - Go 1.26, the house version [f2b0613]

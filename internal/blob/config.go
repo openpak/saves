@@ -83,6 +83,32 @@ func (c Config) Describe() map[string]any {
 	return out
 }
 
+// LocationID names the destination itself and not the credentials that reach it: the same
+// bucket with a rotated key is the same location, another bucket on the same provider is not.
+// A version records the location it was written to, so connecting different storage later
+// cannot make an old backup read — or be deleted — somewhere it never lived.
+//
+// ponytail: for the OAuth kinds this is the account the provider reported. A provider that
+// reports no account leaves every connection of that kind looking like one location; if that
+// ever matters, mint an id at connect time and seal it with the config.
+func (c Config) LocationID() string {
+	switch c.Kind {
+	case KindS3:
+		if c.S3 != nil {
+			return fmt.Sprintf("s3:%s/%s/%s", c.S3.Endpoint, c.S3.Bucket, strings.Trim(c.S3.Prefix, "/"))
+		}
+	case KindWebDAV:
+		if c.WebDAV != nil {
+			return "webdav:" + strings.TrimRight(c.WebDAV.URL, "/")
+		}
+	case KindGoogle, KindOneDrive:
+		if c.OAuth != nil {
+			return c.Kind + ":" + c.OAuth.Account
+		}
+	}
+	return c.Kind
+}
+
 // NewBackend opens the backend a Config describes.
 func NewBackend(cfg Config, p Providers) (Backend, error) {
 	switch cfg.Kind {

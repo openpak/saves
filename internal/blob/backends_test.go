@@ -172,3 +172,30 @@ func TestGoogleDriveBackend(t *testing.T) {
 		t.Fatal("an unconfigured provider must not produce a consent URL")
 	}
 }
+
+// A location is the destination, not the credentials: rotating a key keeps a version readable,
+// pointing at another bucket does not.
+func TestLocationID(t *testing.T) {
+	bucket := func(endpoint, name, prefix, key string) Config {
+		return Config{Kind: KindS3, S3: &S3Config{Endpoint: endpoint, Bucket: name, Prefix: prefix, AccessKey: key, SecretKey: "s"}}
+	}
+	a := bucket("https://s3.example", "saves", "openpak", "AKIA1")
+	if a.LocationID() != bucket("https://s3.example", "saves", "openpak", "AKIA2").LocationID() {
+		t.Fatal("rotating the access key must not move the location")
+	}
+	for _, other := range []Config{
+		bucket("https://s3.example", "saves-2", "openpak", "AKIA1"),
+		bucket("https://other.example", "saves", "openpak", "AKIA1"),
+		bucket("https://s3.example", "saves", "elsewhere", "AKIA1"),
+		{Kind: KindWebDAV, WebDAV: &WebDAVConfig{URL: "https://cloud.example/dav"}},
+		{Kind: KindGoogle, OAuth: &OAuthConfig{Provider: KindGoogle, Account: "a@example.com"}},
+	} {
+		if other.LocationID() == a.LocationID() {
+			t.Fatalf("%s must be a different location", other.LocationID())
+		}
+	}
+	g := Config{Kind: KindGoogle, OAuth: &OAuthConfig{Provider: KindGoogle, Account: "a@example.com"}}
+	if g.LocationID() == (Config{Kind: KindGoogle, OAuth: &OAuthConfig{Provider: KindGoogle, Account: "b@example.com"}}).LocationID() {
+		t.Fatal("two drives are two locations")
+	}
+}
