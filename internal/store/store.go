@@ -576,6 +576,20 @@ func (s *Store) PutSettings(ctx context.Context, account, kind string, config []
 	return err
 }
 
+// UpdateConfig replaces the sealed settings, but only while they are still the ones the
+// caller read: a credential the provider rotated under an old connection must not overwrite
+// the storage a player has since connected.
+func (s *Store) UpdateConfig(ctx context.Context, account string, old, sealed []byte) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE storage_settings SET config=$2 WHERE account_id=$1 AND config=$3`, account, sealed, old)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) DeleteSettings(ctx context.Context, account string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM storage_settings WHERE account_id=$1`, account)
 	return err

@@ -30,7 +30,17 @@ func NewWebDAV(cfg WebDAVConfig) (Backend, error) {
 	if cfg.Username == "" || cfg.Password == "" {
 		return nil, errors.New("username and password are required")
 	}
-	return &davShare{base: u, user: cfg.Username, pass: cfg.Password, c: &http.Client{Timeout: 10 * time.Minute}}, nil
+	if err := checkHost(u.Hostname()); err != nil {
+		return nil, err
+	}
+	// A redirect is another destination, and the share chooses it: check every hop.
+	c := &http.Client{Timeout: 10 * time.Minute, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 5 {
+			return errors.New("too many redirects")
+		}
+		return checkHost(req.URL.Hostname())
+	}}
+	return &davShare{base: u, user: cfg.Username, pass: cfg.Password, c: c}, nil
 }
 
 func (w *davShare) href(key string) string {

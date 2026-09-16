@@ -154,6 +154,9 @@ func NewS3(cfg S3Config) (Backend, error) {
 	if cfg.Endpoint == "" || cfg.Bucket == "" || cfg.AccessKey == "" || cfg.SecretKey == "" {
 		return nil, errors.New("endpoint, bucket, access key and secret key are all required")
 	}
+	if err := checkEndpoint(cfg.Endpoint); err != nil {
+		return nil, err
+	}
 	lookup := minio.BucketLookupAuto
 	if cfg.PathStyle {
 		lookup = minio.BucketLookupPath

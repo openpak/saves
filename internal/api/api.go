@@ -19,12 +19,14 @@
 package api
 
 import (
+	"archive/zip"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -264,16 +266,23 @@ func (s *Server) getVersion(w http.ResponseWriter, r *http.Request) {
 	s.stream(w, r, r.PathValue("account"), v)
 }
 
-// stream sends a single-part version's bytes. A multi-part (console) version has no single
-// download shape yet and answers 409.
+// stream sends a version's bytes: an emulator save is one part and leaves as it arrived, a
+// console backup is several and leaves as a zip.
 func (s *Server) stream(w http.ResponseWriter, r *http.Request, account string, v *store.Version) {
-	if len(v.Parts) != 1 {
-		jsonErr(w, http.StatusConflict, "this version has several parts; download is not available for console backups yet")
+	if len(v.Parts) == 0 {
+		jsonErr(w, http.StatusConflict, "this version has no content")
 		return
 	}
 	b, err := s.Svc.BackendAt(r.Context(), account, v.Loc())
 	if err != nil {
 		failWith(w, err)
+		return
+	}
+	w.Header().Set("X-Save-Version", strconv.Itoa(v.Number))
+	w.Header().Set("X-Save-Sha256", v.SHA256)
+	w.Header().Set("X-Save-Conflict", strconv.FormatBool(v.Conflict))
+	if len(v.Parts) > 1 {
+		s.streamZip(w, r, b, v)
 		return
 	}
 	rc, size, err := b.Get(r.Context(), v.Parts[0].Key)
@@ -284,10 +293,36 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, account string, 
 	defer rc.Close()
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
-	w.Header().Set("X-Save-Version", strconv.Itoa(v.Number))
-	w.Header().Set("X-Save-Sha256", v.SHA256)
-	w.Header().Set("X-Save-Conflict", strconv.FormatBool(v.Conflict))
 	_, _ = io.Copy(w, rc)
+}
+
+// streamZip is how a console backup leaves whole: one entry per component, named by the index
+// the console gave it, stored rather than deflated because those bytes arrive encrypted and do
+// not compress. The parts are read as they are written out, so nothing is staged on disk;
+// a backend that fails mid-way can only truncate the zip and say so in the log.
+func (s *Server) streamZip(w http.ResponseWriter, r *http.Request, b blob.Backend, v *store.Version) {
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", fmt.Sprintf("save-v%d.zip", v.Number)))
+	zw := zip.NewWriter(w)
+	for _, p := range v.Parts {
+		rc, _, err := b.Get(r.Context(), p.Key)
+		if err != nil {
+			log.Printf("[saves] export version %d part %d: %v", v.ID, p.ID, err)
+			return
+		}
+		f, err := zw.CreateHeader(&zip.FileHeader{Name: fmt.Sprintf("%06d-%s.bin", p.Index, p.Kind), Method: zip.Store, Modified: v.CreatedAt})
+		if err == nil {
+			_, err = io.Copy(f, rc)
+		}
+		rc.Close()
+		if err != nil {
+			log.Printf("[saves] export version %d part %d: %v", v.ID, p.ID, err)
+			return
+		}
+	}
+	if err := zw.Close(); err != nil {
+		log.Printf("[saves] export version %d: %v", v.ID, err)
+	}
 }
 
 func (s *Server) pin(w http.ResponseWriter, r *http.Request) {
@@ -513,5 +548,3 @@ func (s *Server) move(w http.ResponseWriter, r *http.Request) {
 	go s.Svc.Move(account)
 	jsonOut(w, http.StatusAccepted, map[string]any{"move_state": "moving"})
 }
-
-var _ = fmt.Sprintf

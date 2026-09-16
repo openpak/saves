@@ -56,6 +56,8 @@ func main() {
 		log.Fatalf("local storage: %v", err)
 	}
 	allowance, _ := strconv.ParseInt(env("SAVES_ALLOWANCE_BYTES", "268435456"), 10, 64)
+	// Off by default: player storage on this host's own network is an administrator's choice.
+	blob.AllowPrivateStorage = os.Getenv("SAVES_ALLOW_PRIVATE_STORAGE") != ""
 	credKey := required("SAVES_CREDENTIAL_KEY")
 	if len(credKey) < 32 {
 		log.Fatal("SAVES_CREDENTIAL_KEY must be at least 32 bytes")

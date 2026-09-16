@@ -15,7 +15,16 @@ import (
 
 // The WebDAV backend against a real WebDAV server (x/net's), through Test and the four verbs:
 // parents are created on demand, sizes come back, and a wrong password is refused.
+// allowLocal lets a test point a backend at its own httptest server; production refuses that
+// destination on purpose (guard.go).
+func allowLocal(t *testing.T) {
+	t.Helper()
+	AllowPrivateStorage = true
+	t.Cleanup(func() { AllowPrivateStorage = false })
+}
+
 func TestWebDAVBackend(t *testing.T) {
+	allowLocal(t)
 	h := &webdav.Handler{FileSystem: webdav.NewMemFS(), LockSystem: webdav.NewMemLS()}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if u, p, ok := r.BasicAuth(); !ok || u != "alice" || p != "app-pass" {
@@ -197,5 +206,22 @@ func TestLocationID(t *testing.T) {
 	g := Config{Kind: KindGoogle, OAuth: &OAuthConfig{Provider: KindGoogle, Account: "a@example.com"}}
 	if g.LocationID() == (Config{Kind: KindGoogle, OAuth: &OAuthConfig{Provider: KindGoogle, Account: "b@example.com"}}).LocationID() {
 		t.Fatal("two drives are two locations")
+	}
+}
+
+// Storage on the deployment's own network is refused unless an administrator says otherwise.
+func TestCheckHost(t *testing.T) {
+	for _, bad := range []string{"127.0.0.1", "169.254.169.254", "10.0.0.5", "192.168.1.10", "[::1]", "100.64.0.1"} {
+		if err := checkEndpoint(bad + ":9000"); err == nil {
+			t.Fatalf("%s must be refused", bad)
+		}
+	}
+	if err := checkEndpoint("93.184.216.34:443"); err != nil {
+		t.Fatalf("a public address must be allowed: %v", err)
+	}
+	AllowPrivateStorage = true
+	defer func() { AllowPrivateStorage = false }()
+	if err := checkEndpoint("127.0.0.1:9000"); err != nil {
+		t.Fatalf("an administrator may allow a private target: %v", err)
 	}
 }

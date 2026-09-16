@@ -48,7 +48,7 @@ func (s *Service) BackendFor(ctx context.Context, account string) (store.Locatio
 	if err != nil {
 		return store.Location{}, nil, err
 	}
-	b, err := blob.NewBackend(cfg, s.Providers)
+	b, err := s.open(account, st, cfg)
 	if err != nil {
 		return store.Location{}, nil, err
 	}
@@ -74,7 +74,34 @@ func (s *Service) BackendAt(ctx context.Context, account string, loc store.Locat
 	if loc.ID != "" && cfg.LocationID() != loc.ID {
 		return nil, fmt.Errorf("this version lives in %s, and the connected storage is %s: reconnect that storage to reach it", loc.ID, cfg.LocationID())
 	}
-	return blob.NewBackend(cfg, s.Providers)
+	return s.open(account, st, cfg)
+}
+
+// open builds a backend from settings and keeps its credential current: a provider that
+// replaces the refresh token gets the replacement sealed back into the same settings row,
+// and only while that row is still the one this backend was opened from.
+func (s *Service) open(account string, st *store.Settings, cfg blob.Config) (blob.Backend, error) {
+	b, err := blob.NewBackend(cfg, s.Providers)
+	if err != nil {
+		return nil, err
+	}
+	if r, ok := b.(blob.Rotator); ok {
+		seen := st.Config
+		r.OnRotate(func(oc blob.OAuthConfig) {
+			cfg.OAuth = &oc
+			sealed, err := blob.SealConfig(s.CredentialKey, cfg)
+			if err != nil {
+				log.Printf("[saves] %s: sealing the rotated credential: %v", account, err)
+				return
+			}
+			if err := s.Store.UpdateConfig(context.Background(), account, seen, sealed); err != nil {
+				log.Printf("[saves] %s: the rotated credential was not stored (storage changed underneath?): %v", account, err)
+				return
+			}
+			seen = sealed
+		})
+	}
+	return b, nil
 }
 
 // CheckAllowance refuses a write of wanted bytes to the allowance backend when it would not

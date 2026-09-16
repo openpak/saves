@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -310,6 +311,59 @@ func TestFlow(t *testing.T) {
 	}
 	if cur, err := st.Newest(ctx, race.ID); err != nil || cur.ID != liveA.ID {
 		t.Fatalf("current must be the newest non-conflict version, got %+v (%v)", cur, err)
+	}
+
+	// A console backup is several parts and leaves whole, as a zip named by component index.
+	multi, err := st.EnsureSave(ctx, acct, "switch", "0100multi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mv, err := st.NewVersion(ctx, multi.ID, nil, "dev1", store.Location{Backend: blob.Local, ID: blob.Local}, nil, 0, nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, part := range []struct {
+		idx  int
+		kind string
+		body string
+	}{{0, "meta", "meta-bytes"}, {4096, "save", "partition-0"}} {
+		p, err := st.AddPart(ctx, mv.ID, part.idx, part.kind, service.Key(acct, "switch", "0100multi", mv.ID, part.idx))
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, digest, err := svc.PutPart(ctx, local, p, strings.NewReader(part.body), int64(len(part.body)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.SetPartStatus(ctx, p.ID, store.Fixed, &n, digest); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := st.Finish(ctx, mv.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	resp = do("GET", base+"/versions/"+fmt.Sprint(mv.ID), nil, nil)
+	zipped, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || resp.Header.Get("Content-Type") != "application/zip" {
+		t.Fatalf("console export: %d %s", resp.StatusCode, resp.Header.Get("Content-Type"))
+	}
+	zr, err := zip.NewReader(bytes.NewReader(zipped), int64(len(zipped)))
+	if err != nil {
+		t.Fatalf("export is not a zip: %v", err)
+	}
+	inZip := map[string]string{}
+	for _, f := range zr.File {
+		rc, err := f.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(rc)
+		rc.Close()
+		inZip[f.Name] = string(b)
+	}
+	if inZip["000000-meta.bin"] != "meta-bytes" || inZip["004096-save.bin"] != "partition-0" {
+		t.Fatalf("export lost a component: %+v", inZip)
 	}
 
 	// Sealed settings round-trip.

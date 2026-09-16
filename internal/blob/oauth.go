@@ -169,6 +169,7 @@ type oauthBackend struct {
 	mu       sync.Mutex
 	access   string
 	expires  time.Time
+	rotated  func(OAuthConfig)
 	folderID string // Google: the "OpenPak saves" folder, found or created once
 }
 
@@ -180,6 +181,19 @@ func NewOAuthBackend(kind string, cfg OAuthConfig, p Providers) (Backend, error)
 		return nil, err
 	}
 	return &oauthBackend{kind: kind, cfg: cfg, p: p}, nil
+}
+
+// Rotator is a backend whose credential the provider may replace behind our back.
+type Rotator interface{ OnRotate(func(OAuthConfig)) }
+
+// OnRotate registers what to do when the provider hands back a replacement refresh token.
+// The refresh token is the whole credential: Microsoft issues a new one on every refresh and
+// retires the old one, so a replacement that is never stored is a connection that works until
+// the next restart and then does not.
+func (o *oauthBackend) OnRotate(f func(OAuthConfig)) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.rotated = f
 }
 
 func (o *oauthBackend) token(ctx context.Context) (string, error) {
@@ -201,6 +215,12 @@ func (o *oauthBackend) token(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("refresh: %w", err)
 	}
 	o.access, o.expires = tok.AccessToken, time.Now().Add(time.Duration(tok.ExpiresIn)*time.Second)
+	if tok.RefreshToken != "" && tok.RefreshToken != o.cfg.RefreshToken {
+		o.cfg.RefreshToken = tok.RefreshToken
+		if o.rotated != nil {
+			o.rotated(o.cfg)
+		}
+	}
 	return o.access, nil
 }
 

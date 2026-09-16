@@ -11,6 +11,9 @@ of truth; this file is the readable summary.
 - the sweep retries deletions a backend refused
 - every version records the storage location it was written to; changing storage no longer moves old backups
 - ci: vet, race tests and a Postgres that a skip cannot hide
+- a rotated OAuth refresh token is sealed back into the settings it came from
+- console backups export whole, as a zip of their components
+- player storage on this deployment’s own network is refused unless an administrator allows it
 - release: job-scoped registry auth file [989d4b7]
 - release: build on the self-hosted runner with podman; private-repo minutes are metered [1f2bc15]
 - Go 1.26, the house version [f2b0613]
