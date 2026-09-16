@@ -196,6 +196,35 @@ shape, then the format is one a console mints, which is an argument against it b
 Nintendo signature. If they are different shapes, that is the answer the other way. Either
 way it is a question about fs, not about this service.
 
+**The Ghidra pass on FS.bin (F, 2026-09-16).** `FS.bin` is a KIP1 whose three segments
+hactool leaves uncompressed and concatenated after a 0x100 header (text@0, ro@0x1db000,
+data@0x244000); read flat, every absolute address is wrong. Wrapped at true vaddrs into
+`FS.elf` and auto-analysed (5319 functions). Reusable workspace, project and scan tooling:
+`~/openpak-firmware-audit-22.5.0/m0/` (see its `README.md`). What the pass established:
+
+- FS opens **`set:cal`** (settings calibration — device-unique key material) at
+  `FUN_001d07d0`, via the sm GetServiceHandle-by-name path `FUN_001c38d0(&h, "set:cal")`.
+  Device-key access is present in FS itself.
+- The **`spl:fs` string (vaddr 0x1f738c) is unreferenced** — vestigial. FS's save crypto is
+  not reached through that service name, so the earlier "spl:fs delegation" read is withdrawn.
+- The cmif dispatch here is **by numeric command id**, not the libstratosphere
+  `{ver,ver,cmd,handler}` `ServiceCommandMeta` layout: static table-scanning for that struct
+  finds nothing, and many handler targets are not even auto-recognised as functions (they are
+  only data-pointer-referenced). This is the wall the release build was expected to be.
+- The dispatch is a `.data` array of pointers (~0x2520a0+, 8 bytes each) into per-command
+  **argument-metadata** blocks in .rodata (~0x1dcc00-0x1df400, stride 0x22). **Command 16's
+  metadata block is at ~0x1dd128** (cmd_id `0x10` at 0x1dd130, an input-buffer descriptor
+  follows). Command 17 is gated to hosver **20.0.0** (`0x00140000`), confirming this firmware
+  carries `SetLocalKeySeedPackage` next to `SetKeySeedPackage`. Each metadata block has one
+  `.text` referrer (its handler) and one `.data` referrer (its dispatch slot).
+
+**Still open, and now a narrow interactive step.** Correlate cmd 16's dispatch slot -> its
+metadata block -> the `.text` handler, confirm the input is one ~512-byte (0x200) type-5
+buffer, then read that handler: does it verify a signature against an embedded key, call
+device crypto (calibration/SPL keyslot) — both mean no server can mint a package a given
+console accepts — or merely store the bytes? That read is the M0 answer and is best done in
+the Ghidra GUI on the saved `FSm0` project.
+
 ## Policy
 
 `GET policy.hac.lp1.scsi.../api/console/v2/application_policy/<title>/<version>?dtoken=...`
