@@ -166,6 +166,29 @@ courier: it fetches the package over HTTP, reads it out as `$.encoded_key_seed_p
 which lives in package2 and is not in the audit tree. Reading `olsc` further cannot answer
 M0; extracting fs is the next step, and it is the only one that can.
 
+**fs is out (F, 2026-09-16).** `dump-all.sh` only walks Program NCAs, so fs was never in the
+audit tree: it lives in INI1 inside package2, in the BootImagePackage NCA (`0100000000000819`,
+content type Data). On this firmware INI1 is **embedded in the kernel blob**, not a package2
+section of its own, so `hactool --intype=pk21 --ini1dir=` reports `Number of Processes: 00`
+and writes nothing — dump the kernel, find the `INI1` magic inside it (0x8d000 here), carve
+from there, and feed that to hactool. `scripts/extract-fs.sh` in the audit tree does all of it
+and leaves `FS.bin` (2,499,188 bytes decompressed) plus the other six initial processes.
+
+What that does **not** give: fs is a release build. 467 strings over twelve characters, no
+assert paths, and HIPC dispatches by command id rather than by name, so no amount of grepping
+finds the handler. A scan of the whole blob for an RSA public exponent (0x10001) adjacent to a
+256- or 512-byte high-entropy modulus found **none** — which is suggestive and not evidence,
+because a verify routine can hardcode the exponent and keep only the modulus.
+
+The handler to read is `ISaveDataTransferManagerVersion2` **command 16, `SetKeySeedPackage`**,
+taking one type-0x5 buffer (switchbrew, *Filesystem services*). That is a Ghidra job on
+`FS.bin`, and it is the last step between here and M0.
+
+**And one fact that narrows M0 either way (switchbrew):** `SetLocalKeySeedPackage` is command
+17, added in 20.0.0, and it *"can only be used after SetKeySeedPackage, in certain
+conditions"*. So the console's own local package does not stand in for the server's — the
+server package comes first, always. Whatever validates it is not optional.
+
 **One thing worth chasing there (F, inference, not fact):** `olsc` also has
 `GetLocalKeySeedPackage` [1479304] — the console can produce a key seed package *itself*, for
 a transfer with no server in it. If the local package and the server package are the same
