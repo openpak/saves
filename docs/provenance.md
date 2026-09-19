@@ -225,6 +225,30 @@ device crypto (calibration/SPL keyslot) — both mean no server can mint a packa
 console accepts — or merely store the bytes? That read is the M0 answer and is best done in
 the Ghidra GUI on the saved `FSm0` project.
 
+**If the answer is "signed": the fallback is a console patch, as for News (plan, 2026-09-19,
+not yet evidence).** `openpak-nro` already installs the News key swap
+(`news/tools/news-patch`): an IPS in `atmosphere/exefs_patches/`, keyed by the BCAT module's
+build id, that replaces the retail RSA modulus with OpenPak's — the verifier still runs,
+against our key. The same idea applies to fs, with differences that shape the work:
+
+- fs is a **KIP in package2**, not an NSO. `loader` never loads it, so `exefs_patches` do not
+  reach it; the route is `atmosphere/kip_patches/<name>/`, applied at boot by fusee (the
+  mechanism FS sigpatches use). Whether hekate's own package3 boot applies them too is to be
+  confirmed. The NRO can write the file; it takes effect on reboot, and a patch that breaks
+  boot can only be removed from another SD reader.
+- There are **two fs KIPs per firmware** (FS and FS-exFAT). Both need a patch, each keyed to
+  its own build, refusing anything else the way `cmd/newspatch` does.
+- What the patch is depends on the cmd 16 read:
+  - verify against an **embedded public key** → swap the modulus for OpenPak's. A data
+    change, not a bypass. The server then keeps a random seed per archive and signs or wraps
+    it for each console's challenge, so any of the account's consoles can restore.
+  - unwrap with **device keys** (`set:cal`, SPL keyslot) → no key to swap. The patch would
+    have to replace the derivation — code, not data, and `SaveDataTransferManagerVersion2`
+    also serves local console-to-console transfer, which such a patch could weaken.
+  - **stores the bytes** unchecked → no patch; the server can mint packages.
+- While patched, Nintendo's own save-data cloud stops verifying on that console, as game BCAT
+  does under the News key. The NRO's OpenPak/Nintendo choice installs and removes it.
+
 ## Policy
 
 `GET policy.hac.lp1.scsi.../api/console/v2/application_policy/<title>/<version>?dtoken=...`
