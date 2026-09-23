@@ -1,6 +1,6 @@
 name: ci
 
-# vet, build and the race tests on every push and pull request. The database flows are the
+# vet, build and the race tests on every vX.Y.Z tag (and on a manual run). The database flows are the
 # point of this job: SAVES_TEST_REQUIRE_DB makes a missing database a failure instead of a
 # skip, so a green run cannot mean "the integration tests did not run".
 #
@@ -11,8 +11,8 @@ name: ci
 # test database of their own.
 on:
   push:
-    branches: [main]
-  pull_request:
+    tags: ['v*.*.*']
+  workflow_dispatch:
 
 jobs:
   test:

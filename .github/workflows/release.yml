@@ -6,7 +6,7 @@ name: release
 # GitHub-hosted minutes; this repository is private and those are metered.
 on:
   push:
-    tags: ['v*']
+    tags: ['v*.*.*']
   workflow_dispatch:
 
 permissions:
