@@ -3,7 +3,7 @@
 Generated from git history on 2026-09-15. `git log` stays the source
 of truth; this file is the readable summary.
 
-## Unreleased
+## v0.3.0 — 2026-09-16
 
 - scsi: v2 and v3 prefixes, POST-only actions, and a fixed archive that stays fixed
 - the allowance is reserved by the upload, not recomputed after it
@@ -21,7 +21,11 @@ of truth; this file is the readable summary.
 - release: job-scoped registry auth file [989d4b7]
 - release: build on the self-hosted runner with podman; private-repo minutes are metered [1f2bc15]
 - Go 1.26, the house version [f2b0613]
+- ci: a port podman picks, and a release workflow that starts [41f4d25]
 
+## v0.2.1 — 2026-09-10
+
+- WebDAV: create the share's own folder, not only a key's parents [caa9b0e]
 
 ## v0.2.0 — 2026-09-10
 
