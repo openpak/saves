@@ -18,12 +18,12 @@ jobs:
     runs-on: [self-hosted, linux, podman]
     steps:
       - uses: actions/checkout@v4
-      - name: Scratch in the workspace, not the runner's shared /tmp
+      - name: Scratch in the runner's temp, not the machine's shared /tmp
         # /tmp is a RAM disk every build on the machine shares; when it filled on
         # 2026-09-24 a compiler died and a job hung for hours instead of failing.
         run: |
-          mkdir -p "$GITHUB_WORKSPACE/.tmp"
-          echo "TMPDIR=$GITHUB_WORKSPACE/.tmp" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/scratch"
+          echo "TMPDIR=$RUNNER_TEMP/scratch" >> "$GITHUB_ENV"
       # Job-scoped login, never the runner user's own. RUNNER_TEMP is read in a step because
       # the runner context does not exist yet in a job-level env: block, and a workflow that
       # names it there does not start at all.
@@ -41,4 +41,4 @@ jobs:
           echo "pushed $IMG: $TAGS"
       - name: Clear scratch
         if: always()
-        run: rm -rf "$GITHUB_WORKSPACE/.tmp"
+        run: rm -rf "$RUNNER_TEMP/scratch"
