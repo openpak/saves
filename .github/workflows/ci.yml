@@ -22,6 +22,12 @@ jobs:
       DB: saves-ci-${{ github.run_id }}
     steps:
       - uses: actions/checkout@v4
+      - name: Scratch in the workspace, not the runner's shared /tmp
+        # /tmp is a RAM disk every build on the machine shares; when it filled on
+        # 2026-09-24 a compiler died and a job hung for hours instead of failing.
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.tmp"
+          echo "TMPDIR=$GITHUB_WORKSPACE/.tmp" >> "$GITHUB_ENV"
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26.x'
@@ -42,3 +48,6 @@ jobs:
       - name: stop postgres
         if: always()
         run: podman rm -f "$DB" || true
+      - name: Clear scratch
+        if: always()
+        run: rm -rf "$GITHUB_WORKSPACE/.tmp"
