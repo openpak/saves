@@ -17,7 +17,7 @@ jobs:
   image:
     runs-on: [self-hosted, linux, podman]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Scratch in the runner's temp, not the machine's shared /tmp
         # /tmp is a RAM disk every build on the machine shares; when it filled on
         # 2026-09-24 a compiler died and a job hung for hours instead of failing.
