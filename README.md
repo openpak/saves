@@ -1,6 +1,6 @@
 # saves
 
-Cloud saves for OpenPak. Platform-neutral service on port 20020 ([`ports.md`](../ports.md)):
+Cloud saves for OpenPak. Platform-neutral service on port 20020 ([`ports.md`](https://github.com/openpak/docs/blob/main/ports.md)):
 the index of every save under an account, a small OpenPak-hosted allowance per account, and
 the player's own S3-compatible storage for everything beyond it. The plan is
 [`prds/cloud-saves-prd.md`](prds/cloud-saves-prd.md); what is known about the console's
@@ -61,7 +61,7 @@ rotating it means every player re-enters their secret. Back it up with the datab
 
 ## Ground rules
 
-- Clean room. Read [`docs/clean-room-policy.md`](../docs/clean-room-policy.md) first.
+- Clean room. Read [`docs/clean-room-policy.md`](https://github.com/openpak/docs/blob/main/clean-room-policy.md) first.
 - AGPL-3.0-only, English only, Go 1.25, no secrets in the repository.
 
 This project is not affiliated with or endorsed by Nintendo or any original service provider.

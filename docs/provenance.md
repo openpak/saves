@@ -1,7 +1,7 @@
 # Provenance: the Switch save-data cloud, as far as it is known
 
 Every non-obvious fact the saves service is built on, and where it came from. Per
-[`docs/clean-room-policy.md`](../../docs/clean-room-policy.md): the earlier server's `nx-scsi` is read
+[`docs/clean-room-policy.md`](https://github.com/openpak/docs/blob/main/clean-room-policy.md): the earlier server's `nx-scsi` is read
 for facts about the console and the wire, never for code or shape. Nothing below is theirs to
 own; a path, a field name or a status string is a fact about the console.
 

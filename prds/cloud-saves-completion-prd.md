@@ -61,7 +61,7 @@ Its replay test sends synthetic save bytes and checks HTTP responses during a de
 
 Component completion records client-supplied size/digest; archive completion discards the MAC body. These observations are protocol experiments, not a production integrity model to adopt. Source: handlers.go (archived source record).
 
-Follow [OpenPak’s clean-room policy](../../docs/clean-room-policy.md): retain facts and citations only; do not copy source, captured cryptographic material, implementation structure or prose. This review adds no earlier implementation to OpenPak.
+Follow [OpenPak’s clean-room policy](https://github.com/openpak/docs/blob/main/clean-room-policy.md): retain facts and citations only; do not copy source, captured cryptographic material, implementation structure or prose. This review adds no earlier implementation to OpenPak.
 
 ## Verified gaps and their consequences
 
