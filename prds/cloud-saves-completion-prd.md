@@ -19,7 +19,7 @@ No percentage-complete estimate: implemented routes, successful tests and verifi
 
 Reviewed `saves`, website saves handlers/templates/client, the Flutter saves page, shared `openpak-client` API/sync implementation, selected emulator integration call sites, `nx-baas` forwarding, existing PRD and provenance, and public legacy/nx-scsi source.
 
-The local `saves` HEAD was `989d4b77a2e90340d10c0d6d4b96b18d0a15a623`. `internal/api/flow_test.go` already had uncommitted changes; the audit preserved them and tested the working tree. This workspace is a collection of repositories; its root and `prds` are not Git repositories.
+The local `saves` HEAD was `11bd6e15d0c250391d52c1a681f7023ed9561366`. `internal/api/flow_test.go` already had uncommitted changes; the audit preserved them and tested the working tree. This workspace is a collection of repositories; its root and `prds` are not Git repositories.
 
 This is a source and local-test audit, not production certification. The old README reports deployment on September 10; production image identity, account journeys, real provider credentials, console logs and hardware round trips were not verified in this review. Emulator forks were sampled for integration, not all built or exercised.
 
