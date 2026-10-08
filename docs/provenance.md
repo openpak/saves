@@ -275,9 +275,9 @@ the formats from getting in each other's way:
 - the emulator API's newest save is the newest emulator-format version, and the console list
   holds console archives only.
 
-Continuity across formats is not the server's job and will not be: converting an emulator save
-into a console archive (or back) needs the user's console keys, which the server never has. The
-plan is for clients that do hold the user's keys, Harbor first, to convert: Harbor reads the
-newest console archive, decrypts it and writes an emulator save as a new version, and takes the
-newest emulator save, encrypts it and uploads it through the console protocol as a new archive.
-The server only stores and lists both kinds in the one history. Not built yet.
+There is no conversion between the formats, and none is planned. Console archives are for
+consoles and for Harbor, which acts exactly like a real console: it uses only console archives,
+through the console protocol, and never converts emulator saves. Emulator saves are for the
+emulator API. The old Ryujinx and other emulator saves are not carried over into console
+archives. The server could not convert them anyway: that needs the user's console keys, which
+it never has.
