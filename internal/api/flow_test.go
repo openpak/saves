@@ -4,7 +4,16 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net/http"
@@ -421,9 +430,9 @@ func TestFlow(t *testing.T) {
 		t.Fatalf("export lost a component: %+v", inZip)
 	}
 
-	// M0 is an experiment, not a service: without SAVES_M0_KEY_SEED nothing is minted.
+	// Without the package keys configured nothing is minted: 503.
 	if resp := do("POST", "/scsi/api/console/v3/save_data_archives/"+aid+"/generate_key_seed_package", strings.NewReader(`{"encoded_challenge":"AAAA"}`), sw); resp.StatusCode != 503 {
-		t.Fatalf("the key seed experiment must be off by default, got %d", resp.StatusCode)
+		t.Fatalf("a server without package keys must answer 503, got %d", resp.StatusCode)
 	} else {
 		resp.Body.Close()
 	}
@@ -507,6 +516,47 @@ func TestFlow(t *testing.T) {
 // The console list is console archives only (olsc-findings §6.1.10): an account whose only
 // Switch saves were stored by the retired emulator API sees an empty cloud, and a console
 // upload made next to them is listed alone and whole.
+
+// throwawayKSPKeys are the package keys of a test: a fresh RSA-2048 key and package key written
+// to files, as the box mounts the real ones. Nothing here is a real key.
+func throwawayKSPKeys(t *testing.T) (signing, pkgKey string, pub *rsa.PublicKey, key [16]byte) {
+	t.Helper()
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, _ := x509.MarshalPKCS8PrivateKey(priv)
+	dir := t.TempDir()
+	signing, pkgKey = dir+"/sign.pem", dir+"/pkg.key"
+	if err := os.WriteFile(signing, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = rand.Read(key[:])
+	if err := os.WriteFile(pkgKey, key[:], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return signing, pkgKey, &priv.PublicKey, key
+}
+
+// openPackage is what fs does with a key seed package (GCM body at +0x80 with IV +0x10 and tag
+// +0x20, PSS over Content, the challenge at Content+0x30); it returns Content.
+func openPackage(t *testing.T, pkg []byte, key [16]byte, pub *rsa.PublicKey, challenge []byte) []byte {
+	t.Helper()
+	block, _ := aes.NewCipher(key[:])
+	gcm, _ := cipher.NewGCMWithNonceSize(block, 16)
+	plain, err := gcm.Open(nil, pkg[0x10:0x20], append(append([]byte{}, pkg[0x80:]...), pkg[0x20:0x30]...), nil)
+	if err != nil {
+		t.Fatalf("the package body does not open (2-7002): %v", err)
+	}
+	digest := sha256.Sum256(plain[0x100:])
+	if err := rsa.VerifyPSS(pub, crypto.SHA256, digest[:], plain[:0x100], &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthAuto}); err != nil {
+		t.Fatalf("the signature does not verify (2-7003): %v", err)
+	}
+	if !bytes.Equal(plain[0x100+0x30:0x100+0x40], challenge) {
+		t.Fatal("the challenge in the package is not the request's (2-7004)")
+	}
+	return plain[0x100:]
+}
 func TestConsoleListOnlyConsoleArchives(t *testing.T) {
 	dbURL := requireDB(t)
 	st, err := store.Open(dbURL)
@@ -515,11 +565,16 @@ func TestConsoleListOnlyConsoleArchives(t *testing.T) {
 	}
 	defer st.Close()
 	local, _ := blob.NewLocal(t.TempDir())
-	svc := &service.Service{Store: st, Local: local, Allowance: 1 << 20, CredentialKey: []byte("k"), URLKey: []byte("u"),
+	svc := &service.Service{Store: st, Local: local, Allowance: 100 << 20, CredentialKey: []byte("k"), URLKey: []byte("u"),
 		UploadHost: "up.test", DownloadHost: "down.test"}
 	mux := http.NewServeMux()
 	(&api.Server{Svc: svc, Key: "internal"}).Register(mux)
-	(&switchscsi.Server{Svc: svc}).Register(mux)
+	kspSigning, kspPkgKey, kspPub, kspKey := throwawayKSPKeys(t)
+	ksp, err := switchscsi.LoadKSP(kspSigning, kspPkgKey, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	(&switchscsi.Server{Svc: svc, KSP: ksp}).Register(mux)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 	acct := fmt.Sprintf("acct-console-%d", os.Getpid())
@@ -620,17 +675,21 @@ func TestConsoleListOnlyConsoleArchives(t *testing.T) {
 	// A full console upload. The console creates index 0 itself although start_upload listed it.
 	digest := "AQIDBAUGBwgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 	code, b = do("POST", "/scsi/api/console/v3/save_data_archives/start_upload",
-		`{"application_id":"`+title+`","datatype":0,"data_size":16,"saved_at_as_unixtime":1783207776,"launch_required_version":0,"series_id":42,"encoded_digest":"`+digest+`","desc":null,"auto_backup":false,"acd_index":0}`, sw)
+		`{"application_id":"`+title+`","datatype":0,"data_size":20971520,"saved_at_as_unixtime":1783207776,"launch_required_version":0,"series_id":42,"encoded_digest":"`+digest+`","desc":null,"auto_backup":false,"acd_index":0}`, sw)
 	var started struct {
 		A struct {
-			ID    int64 `json:"id"`
-			Comps []struct {
+			ID         int64 `json:"id"`
+			Partitions int   `json:"num_of_partitions"`
+			Comps      []struct {
 				ID int64 `json:"id"`
 			} `json:"component_files"`
 		} `json:"save_data_archive"`
 	}
 	if _ = json.Unmarshal(b, &started); code != 201 || len(started.A.Comps) != 1 {
 		t.Fatalf("start_upload: %d %s", code, b)
+	}
+	if started.A.Partitions != 3 {
+		t.Fatalf("a 20 MiB upload is three 8 MiB divisions, start_upload answered %d", started.A.Partitions)
 	}
 	aid := fmt.Sprint(started.A.ID)
 	if l := list(); len(l) != 0 {
@@ -661,12 +720,47 @@ func TestConsoleListOnlyConsoleArchives(t *testing.T) {
 			t.Fatalf("component finish: %d %s", code, b)
 		}
 	}
-	if code, b := do("POST", "/scsi/api/console/v3/save_data_archives/"+aid+"/finish_upload", `{"encoded_key_seed":"c2VlZA","encoded_mac":"bWFj"}`, sw); code != 200 {
+	seed, mac, challenge := bytes.Repeat([]byte{0x11}, 16), bytes.Repeat([]byte{0x22}, 16), bytes.Repeat([]byte{0x33}, 16)
+	seedB64, macB64 := base64.RawURLEncoding.EncodeToString(seed), base64.RawURLEncoding.EncodeToString(mac)
+	if code, b := do("POST", "/scsi/api/console/v3/save_data_archives/"+aid+"/finish_upload", `{"encoded_key_seed":"`+seedB64+`","encoded_mac":"`+macB64+`"}`, sw); code != 200 {
 		t.Fatalf("finish_upload: %d %s", code, b)
 	}
 	v, err := st.Version(context.Background(), started.A.ID)
-	if err != nil || v.Meta["encoded_key_seed"] != "c2VlZA" || v.Meta["encoded_mac"] != "bWFj" {
+	if err != nil || v.Meta["encoded_key_seed"] != seedB64 || v.Meta["encoded_mac"] != macB64 {
 		t.Fatalf("finish_upload must keep the key seed and MAC: %v %v", err, v)
+	}
+
+	// The key seed package for this archive: the stored seed and MAC, the console's challenge,
+	// and the body FS opens with the package key.
+	code, b = do("POST", "/scsi/api/console/v3/save_data_archives/"+aid+"/generate_key_seed_package",
+		`{"encoded_challenge":"`+base64.RawURLEncoding.EncodeToString(challenge)+`"}`, sw)
+	var kspOut struct {
+		Pkg string `json:"encoded_key_seed_package"`
+	}
+	_ = json.Unmarshal(b, &kspOut)
+	pkg, _ := base64.RawURLEncoding.DecodeString(kspOut.Pkg)
+	if code != 200 || len(pkg) != 512 || pkg[8] != 5 {
+		t.Fatalf("generate_key_seed_package: %d %d bytes %s", code, len(pkg), b)
+	}
+	if content := openPackage(t, pkg, kspKey, kspPub, challenge); !bytes.Equal(content[0x10:0x20], seed) || !bytes.Equal(content[0x20:0x30], mac) {
+		t.Fatal("the package does not carry the archive's seed and MAC")
+	}
+	if code, _ := do("POST", "/scsi/api/console/v3/save_data_archives/"+aid+"/generate_key_seed_package", `{"encoded_challenge":"AAAA"}`, sw); code != 400 {
+		t.Fatalf("a challenge that is not 16 bytes: %d, want 400", code)
+	}
+	if code, _ := do("POST", "/scsi/api/console/v3/save_data_archives/"+aid+"/generate_key_seed_package",
+		`{"encoded_challenge":"`+base64.RawURLEncoding.EncodeToString(challenge)+`"}`, map[string]string{"X-OpenPak-Account": "someone-else"}); code != 404 {
+		t.Fatalf("another account's package request: %d, want 404", code)
+	}
+	// A delta upload repeats its previous archive's division count whatever size it declares.
+	code, b = do("POST", "/scsi/api/console/v3/save_data_archives/"+aid+"/start_upload", `{"application_id":"`+title+`","datatype":0,"data_size":16,"saved_at_as_unixtime":1783207777,"launch_required_version":0,"series_id":42,"encoded_digest":"`+digest+`","acd_index":0}`, sw)
+	var delta struct {
+		A struct {
+			Partitions int `json:"num_of_partitions"`
+		} `json:"save_data_archive"`
+	}
+	if _ = json.Unmarshal(b, &delta); code != 201 || delta.A.Partitions != 3 {
+		t.Fatalf("delta start_upload: %d partitions=%d %s", code, delta.A.Partitions, b)
 	}
 
 	// Listed alone, and as complete as the 23.0.1 record check wants it.
@@ -685,6 +779,9 @@ func TestConsoleListOnlyConsoleArchives(t *testing.T) {
 		if val == nil && k != "desc" && k != "previous_save_data_archive_id" && k != "finished_at_as_unixtime" {
 			t.Errorf("listed archive has %q null", k)
 		}
+	}
+	if rec["num_of_partitions"] != float64(3) {
+		t.Fatalf("listed num_of_partitions: %v", rec["num_of_partitions"])
 	}
 	if rec["status"] != "fixed" || rec["encoded_digest"] != digest || rec["finished_at_as_unixtime"] == nil {
 		t.Fatalf("listed archive: %v", rec)

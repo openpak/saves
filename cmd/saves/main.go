@@ -106,7 +106,7 @@ func main() {
 			allow[t] = true
 		}
 	}
-	(&switchscsi.Server{Svc: svc, AllowTitles: allow, KeySeed: os.Getenv("SAVES_M0_KEY_SEED") != ""}).Register(mux)
+	(&switchscsi.Server{Svc: svc, AllowTitles: allow, KSP: loadKSP()}).Register(mux)
 
 	go func() {
 		for {
@@ -119,4 +119,26 @@ func main() {
 	log.Printf("saves listening on %s (allowance %d bytes, local %s)", addr, allowance, env("SAVES_LOCAL_DIR", "/app/data"))
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	log.Fatal(srv.ListenAndServe())
+}
+
+// loadKSP reads the key seed package keys from the files the environment names. Either missing
+// or unreadable leaves the endpoint answering 503; the reason is logged, the key material never.
+func loadKSP() *switchscsi.KSP {
+	signing, pkgKey := os.Getenv("SAVES_KSP_SIGNING_KEY_FILE"), os.Getenv("SAVES_KSP_PACKAGE_KEY_FILE")
+	if signing == "" || pkgKey == "" {
+		log.Printf("saves: key seed packages off: SAVES_KSP_SIGNING_KEY_FILE and SAVES_KSP_PACKAGE_KEY_FILE are not both set")
+		return nil
+	}
+	gen, err := strconv.Atoi(env("SAVES_KSP_KEY_GENERATION", strconv.Itoa(switchscsi.MinKeyGeneration)))
+	if err != nil {
+		log.Printf("saves: key seed packages off: SAVES_KSP_KEY_GENERATION is not a number")
+		return nil
+	}
+	k, err := switchscsi.LoadKSP(signing, pkgKey, gen)
+	if err != nil {
+		log.Printf("saves: key seed packages off: %v", err)
+		return nil
+	}
+	log.Printf("saves: key seed packages on (key generation %d)", gen)
+	return k
 }

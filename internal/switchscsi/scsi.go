@@ -11,7 +11,6 @@ package switchscsi
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -44,11 +43,8 @@ type Server struct {
 	Svc *service.Service
 	// AllowTitles, when non-empty, is the set of title ids whose policy is ALL_OK; empty allows all.
 	AllowTitles map[string]bool
-	// KeySeed answers generate_key_seed_package with random bytes of the documented size. It is
-	// off by default: nobody has minted one of these, the console's own key derivation happens
-	// in fs and not in olsc, and a console that acts on a package we invented is doing
-	// something no one has watched it do. Turn it on to run that experiment (M0).
-	KeySeed bool
+	// KSP builds generate_key_seed_package answers. Nil (keys not configured) answers 503.
+	KSP *KSP
 }
 
 func (s *Server) Register(mux *http.ServeMux) {
@@ -266,10 +262,8 @@ func (s *Server) archiveOf(v *store.Version, sv *store.Save, c caller, withParts
 	if v.TimeoutAt != nil && v.Status == store.Uploading {
 		a.TimeoutAt = v.TimeoutAt.Unix()
 	}
+	a.NumOfPartitions = partitionsOf(v)
 	for _, p := range v.Parts {
-		if p.Kind == "save" {
-			a.NumOfPartitions++
-		}
 		if withParts {
 			a.ComponentFiles = append(a.ComponentFiles, componentOf(p))
 		}
@@ -359,26 +353,7 @@ func (s *Server) archives(ctx context.Context, w http.ResponseWriter, r *http.Re
 		if !ok {
 			return
 		}
-		var in struct {
-			Challenge string `json:"encoded_challenge"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&in)
-		if !s.KeySeed {
-			log.Printf("[scsi] M0 key_seed_package archive=%d challenge=%q -> refused (SAVES_M0_KEY_SEED unset)", id, in.Challenge)
-			nintendoErr(w, http.StatusServiceUnavailable, "service_unavailable", "Not available", "this server does not mint key seed packages")
-			return
-		}
-		// The experiment: fresh random bytes of the documented size. The console derives its
-		// key in fs, not in olsc, so whether it accepts this is decided somewhere we cannot
-		// read — the log line below, and whether the archive is ever finished, is the answer.
-		pkg := make([]byte, 512)
-		_, _ = rand.Read(pkg)
-		if v != nil && v.Meta != nil {
-			v.Meta["key_seed_drawn"] = true
-			_ = s.Svc.Store.SetMeta(ctx, v.ID, v.Meta)
-		}
-		log.Printf("[scsi] M0 key_seed_package archive=%d challenge=%q -> random 512 bytes", id, in.Challenge)
-		out(w, 200, map[string]any{"encoded_key_seed_package": base64.RawURLEncoding.EncodeToString(pkg)})
+		s.keySeedPackage(w, r, v, id)
 	case "start_upload":
 		if !ok {
 			return
@@ -441,7 +416,7 @@ func (s *Server) archives(ctx context.Context, w http.ResponseWriter, r *http.Re
 			return
 		}
 		// A full upload sends the exporter's key seed and MAC; a delta sends the MAC alone and
-		// keeps its series' seed. generate_key_seed_package will wrap both (§6.1.3, §6.1.4).
+		// keeps its series' seed. generate_key_seed_package wraps both (§6.1.3, §6.1.4).
 		if in.KeySeed == "" {
 			if prev, err := s.Svc.Store.Version(ctx, metaInt(v.Meta, "previous_id")); err == nil {
 				in.KeySeed = metaStr(prev.Meta, "encoded_key_seed")
@@ -459,11 +434,6 @@ func (s *Server) archives(ctx context.Context, w http.ResponseWriter, r *http.Re
 		}
 		for _, g := range gone {
 			s.Svc.DeleteBlobs(ctx, c.account, g)
-		}
-		if v.Meta["key_seed_drawn"] == true {
-			// M0 answered, in the only way it can be: the console took a package this server
-			// invented and finished the archive anyway.
-			log.Printf("[scsi] M0 ANSWER archive=%d finished after a server-minted key seed package, mac=%q", v.ID, in.MAC)
 		}
 		s.Svc.Store.Audit(ctx, c.account, "switch_upload", map[string]any{"title": sv.TitleID, "version": live.Number, "mac": in.MAC})
 		out(w, 200, map[string]any{"save_data_archive": s.archiveOf(live, sv, c, true)})
@@ -621,7 +591,10 @@ func (s *Server) startUpload(ctx context.Context, w http.ResponseWriter, r *http
 	}
 	delete(meta, "encoded_key_seed")
 	delete(meta, "encoded_mac")
+	// The console calls SetDivisionCount with this; a delta must repeat its previous archive's.
+	meta["num_of_partitions"] = partitionsFor(in.DataSize)
 	if prev != nil {
+		meta["num_of_partitions"] = partitionsOf(prev)
 		meta["previous_id"] = prev.ID
 		if meta["device_id"] == "" {
 			meta["device_id"] = metaStr(prev.Meta, "device_id")
@@ -915,4 +888,83 @@ func (s *Server) policy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out(w, 200, map[string]any{"policy_type": "ALL_OK"})
+}
+
+// keySeedPackage answers generate_key_seed_package: the 512-byte KeySeedPackageV0 for this
+// archive's stored seed and MAC and the console's 16-byte challenge. Nothing here is logged but
+// the archive id and the outcome: the seed, MAC and challenge are key material.
+func (s *Server) keySeedPackage(w http.ResponseWriter, r *http.Request, v *store.Version, id int64) {
+	if s.KSP == nil {
+		log.Printf("[scsi] key_seed_package archive=%d: refused, the package keys are not configured (SAVES_KSP_SIGNING_KEY_FILE, SAVES_KSP_PACKAGE_KEY_FILE)", id)
+		nintendoErr(w, http.StatusServiceUnavailable, "service_unavailable", "Not available", "this server does not mint key seed packages")
+		return
+	}
+	if v.Status != store.Live {
+		notFixed(w, "this archive is still uploading")
+		return
+	}
+	var in struct {
+		Challenge string `json:"encoded_challenge"`
+	}
+	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<12)).Decode(&in)
+	challenge, ok := b64Fixed(in.Challenge, 16, false)
+	if !ok {
+		nintendoErr(w, http.StatusBadRequest, "invalid_parameter", "Invalid parameter", "encoded_challenge must be 16 bytes, base64url")
+		return
+	}
+	// The exporter reports its seed as 0x10 bytes, or 0x20 when its key index is set; the
+	// package carries the first 16 either way.
+	seed, ok1 := b64Fixed(metaStr(v.Meta, "encoded_key_seed"), 16, true)
+	mac, ok2 := b64Fixed(metaStr(v.Meta, "encoded_mac"), 16, false)
+	if !ok1 || !ok2 {
+		log.Printf("[scsi] key_seed_package archive=%d: refused, no usable seed/MAC stored", id)
+		nintendoErr(w, http.StatusConflict, "not_fixed", "Archive not usable", "this archive has no key seed on record")
+		return
+	}
+	pkg, err := s.KSP.Build([16]byte(seed), [16]byte(mac), [16]byte(challenge))
+	if err != nil {
+		log.Printf("[scsi] key_seed_package archive=%d: build failed: %v", id, err)
+		nintendoErr(w, http.StatusInternalServerError, "internal_server_error", "Internal error", "could not build the package")
+		return
+	}
+	log.Printf("[scsi] key_seed_package archive=%d: built", id)
+	out(w, 200, map[string]any{"encoded_key_seed_package": base64.RawURLEncoding.EncodeToString(pkg)})
+}
+
+// b64Fixed decodes base64url (padded or not) to exactly n bytes; with orLonger, a longer value
+// is cut to its first n.
+func b64Fixed(s string, n int, orLonger bool) ([]byte, bool) {
+	b, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(s, "="))
+	if err != nil || len(b) < n || (len(b) > n && !orLonger) {
+		return nil, false
+	}
+	return b[:n], true
+}
+
+// partitionBytes is the data one division covers; a full upload's division count is
+// ceil(data_size / partitionBytes) within 1..maxPartitions. Nintendo's own rule is not visible
+// in the console; the importer reads chunk sizes from the initial data, so any value works.
+const (
+	partitionBytes = 8 << 20
+	maxPartitions  = 64
+)
+
+func partitionsFor(dataSize int64) int {
+	n := int((dataSize + partitionBytes - 1) / partitionBytes)
+	if n < 1 {
+		return 1
+	}
+	if n > maxPartitions {
+		return maxPartitions
+	}
+	return n
+}
+
+// partitionsOf is an archive's division count: the one start_upload gave, else (archives from
+// before it was stored) the one its declared size implies.
+func partitionsOf(v *store.Version) int {
+	if n := int(metaInt(v.Meta, "num_of_partitions")); n >= 1 {
+		return n
+	}
+	return partitionsFor(metaInt(v.Meta, "data_size"))
 }

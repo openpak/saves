@@ -278,3 +278,33 @@ archives only"}`. Saves the old API stored (Citron, Ryujinx, Cemu and the rest) 
 at start every live version without the console mark becomes `retired`, which hides it from every
 list, download, restore and console route while keeping it on disk. Nothing converts between
 formats; the server could not (it never has the console keys).
+
+## Key seed package and division count
+
+`start_upload` answers a real `num_of_partitions`: `ceil(data_size / 8 MiB)` within 1..64 for a
+full upload (Nintendo's own rule is not visible; the importer reads chunk sizes from the initial
+data, so any value works), and a delta upload repeats its previous archive's count, as the
+console requires (else 2179-0301). The count is stored with the archive.
+
+`generate_key_seed_package` builds the 512-byte KeySeedPackageV0 that the 23.0.1 fs
+accepts through `SetKeySeedPackage` (Harbor `research/olsc-re/fs-transfer.md` §9.2):
+
+| Offset | Field |
+| --- | --- |
+| `+0x000` | u32 Version = 0 (fs needs < 0x100) |
+| `+0x008` | u8 KeyGeneration (`SAVES_KSP_KEY_GENERATION`, at least 4) |
+| `+0x010` | Iv[16], fresh per package |
+| `+0x020` | GCM tag[16] (fs: 2-7002 when wrong) |
+| `+0x030` | 80 zero bytes |
+| `+0x080` | AES-128-GCM body, 0x180 bytes, no AAD, key = the package key for KeyGeneration, over Signature[256] then Content[128] |
+
+Signature is RSASSA-PSS-SHA256 (MGF1-SHA256, salt 32, e = 65537) over Content with OpenPak's
+private key (fs: 2-7003). Content is `{16 zero bytes, TransferKeySeed[16] (the archive's stored
+encoded_key_seed, first 16 bytes), TransferInitialDataMac[16] (the stored encoded_mac), Challenge[16]
+(the request's encoded_challenge; fs: 2-7004 when it is not this session's), local flag 0, 63 zero
+bytes}`. The server cannot check the MAC (it is keyed inside fs); it returns it as stored.
+
+Both keys are files on the box, named by `SAVES_KSP_SIGNING_KEY_FILE` (PEM RSA-2048 private key,
+PKCS#8 or PKCS#1) and `SAVES_KSP_PACKAGE_KEY_FILE` (the 16-byte package key, as 16 raw bytes or
+32 hex characters). Neither is ever in the repo, the image or a log. With either unset or
+unreadable the endpoint answers 503 and the log says the keys are not configured.

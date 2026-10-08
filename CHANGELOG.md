@@ -3,6 +3,12 @@
 Generated from git history on 2026-09-15. `git log` stays the source
 of truth; this file is the readable summary.
 
+## v0.4.2 — 2026-10-08
+
+- `start_upload` answers a real `num_of_partitions` (one per 8 MiB of `data_size`, 1..64; a delta repeats its previous archive's)
+- `generate_key_seed_package` builds the real KeySeedPackageV0 (AES-128-GCM body, RSA-PSS-SHA256 signature) from keys in files named by `SAVES_KSP_SIGNING_KEY_FILE` and `SAVES_KSP_PACKAGE_KEY_FILE`; without them it answers 503 as before
+- the M0 random-package experiment (`SAVES_M0_KEY_SEED`) is gone
+
 ## v0.4.1 — 2026-10-08
 
 - `DELETE /internal/accounts/{account}/saves/{platform}/{title}` deletes every backup of a title
