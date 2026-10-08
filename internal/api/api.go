@@ -8,6 +8,7 @@
 //	POST   /internal/accounts/{account}/versions/{id}/pin   {"pinned":true}
 //	POST   /internal/accounts/{account}/versions/{id}/restore
 //	DELETE /internal/accounts/{account}/versions/{id}
+//	DELETE /internal/accounts/{account}/saves/{platform}/{title}              every backup of the title (200 {"deleted":n}; 404: none)
 //	GET    /internal/accounts/{account}/storage                                 settings (no secret), usage, move state
 //	PUT    /internal/accounts/{account}/storage      Config JSON (s3 | webdav)  test first, then save
 //	GET    /internal/storage/kinds                   which kinds this deployment offers
@@ -50,6 +51,7 @@ func (s *Server) Register(mux *http.ServeMux) {
 	a("POST /internal/accounts/{account}/versions/{id}/pin", s.pin)
 	a("POST /internal/accounts/{account}/versions/{id}/restore", s.restore)
 	a("DELETE /internal/accounts/{account}/versions/{id}", s.deleteVersion)
+	a("DELETE /internal/accounts/{account}/saves/{platform}/{title}", s.deleteTitle)
 	a("GET /internal/accounts/{account}/storage", s.getStorage)
 	a("PUT /internal/accounts/{account}/storage", s.putStorage)
 	a("DELETE /internal/accounts/{account}/storage", s.deleteStorage)
@@ -100,7 +102,7 @@ type VersionJSON struct {
 	Pinned    bool       `json:"pinned"`
 	Size      int64      `json:"size"`
 	SHA256    string     `json:"sha256,omitempty"`
-	Device    string     `json:"device,omitempty"`
+	Console   string     `json:"console"` // "Harbor" or "Switch"; never a device id
 	Backend   string     `json:"backend"`
 	Parts     int        `json:"parts"`
 	SavedAt   *time.Time `json:"saved_at,omitempty"`
@@ -115,7 +117,16 @@ type SaveJSON struct {
 
 func versionJSON(v store.Version) VersionJSON {
 	return VersionJSON{ID: v.ID, Number: v.Number, Base: v.BaseNumber, Conflict: v.Conflict, Pinned: v.Pinned, Size: v.Size,
-		SHA256: v.SHA256, Device: v.Device, Backend: v.Backend, Parts: len(v.Parts), SavedAt: v.SavedAt, CreatedAt: v.CreatedAt}
+		SHA256: v.SHA256, Console: ConsoleLabel(v.Meta), Backend: v.Backend, Parts: len(v.Parts), SavedAt: v.SavedAt, CreatedAt: v.CreatedAt}
+}
+
+// ConsoleLabel names the console a backup came from for a person: Harbor when the uploading
+// client said so, otherwise Switch. Device ids and serials are never shown.
+func ConsoleLabel(meta map[string]any) string {
+	if c, _ := meta["client"].(string); c == "harbor" {
+		return "Harbor"
+	}
+	return "Switch"
 }
 
 func (s *Server) listSaves(w http.ResponseWriter, r *http.Request) {
@@ -293,6 +304,38 @@ func (s *Server) deleteVersion(w http.ResponseWriter, r *http.Request) {
 	s.Svc.DeleteBlobs(r.Context(), r.PathValue("account"), *gone)
 	s.Svc.Store.Audit(r.Context(), r.PathValue("account"), "delete", map[string]any{"version": v.ID})
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// deleteTitle removes every live backup of one title, pinned ones too: the caller (the
+// account owner, after a confirmation) asked for all of them. The console's list simply no
+// longer contains them.
+func (s *Server) deleteTitle(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	account := r.PathValue("account")
+	sv, err := s.Svc.Store.SaveOf(ctx, account, r.PathValue("platform"), r.PathValue("title"))
+	if err != nil {
+		failWith(w, err)
+		return
+	}
+	vs, err := s.Svc.Store.Versions(ctx, sv.ID, false)
+	if err != nil {
+		failWith(w, err)
+		return
+	}
+	if len(vs) == 0 {
+		jsonErr(w, http.StatusNotFound, "not found")
+		return
+	}
+	for _, v := range vs {
+		gone, err := s.Svc.Store.MarkDeleted(ctx, v.ID)
+		if err != nil {
+			failWith(w, err)
+			return
+		}
+		s.Svc.DeleteBlobs(ctx, account, *gone)
+	}
+	s.Svc.Store.Audit(ctx, account, "delete_title", map[string]any{"title": sv.TitleID, "versions": len(vs)})
+	jsonOut(w, 200, map[string]any{"deleted": len(vs)})
 }
 
 // ---- storage settings ----

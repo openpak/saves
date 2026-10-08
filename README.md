@@ -32,6 +32,27 @@ Who calls it:
   console must resolve those names to OpenPak: `console/openpak-nro` redirects
   `*.scsi.srv.nintendo.net` since 2026-09-10.
 
+## Managing the cloud
+
+The account owner sees and deletes console backups on the website (`/account/saves`) and, later,
+in the app. The website decides who the account is and calls these internal routes
+(`X-Internal-Key`); the app reaches them through the website's authenticated API
+(`/api/v1/me/saves...`, see the website README).
+
+| Route | What |
+| --- | --- |
+| `GET /internal/accounts/{account}/saves` | every title's live backups: `id`, `number`, `size`, `saved_at`, `created_at`, `console` (`Harbor` or `Switch`, never a device id), `conflict`, `pinned`, `parts`; plus `usage` (`allowance_used`, `allowance`, `total`) |
+| `DELETE /internal/accounts/{account}/versions/{id}` | delete one backup (204) |
+| `DELETE /internal/accounts/{account}/saves/{platform}/{title}` | delete every backup of a title, pinned too (200 `{"deleted":n}`, 404 when none) |
+
+A deleted backup leaves the console's list at once and its bytes are removed from the backend.
+The quota is `SAVES_ALLOWANCE_BYTES` per account (default 256 MiB, counted over live and
+uploading backups on the OpenPak-hosted allowance); `start_upload` answers 403
+`storage_quota_exceeded` when the declared size does not fit. The console's own "cloud full"
+error code is not known, so the console sees an HTTP 403 with that Nintendo-shaped body; a
+player who connects their own storage is not limited by it. Which client uploaded a backup is
+read from `X-OpenPak-Client` (`harbor/...` means Harbor, anything else a Switch).
+
 ## Running it
 
 ```sh

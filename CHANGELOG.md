@@ -3,6 +3,12 @@
 Generated from git history on 2026-09-15. `git log` stays the source
 of truth; this file is the readable summary.
 
+## v0.4.1 — 2026-10-08
+
+- `DELETE /internal/accounts/{account}/saves/{platform}/{title}` deletes every backup of a title
+- listed versions carry `console` ("Harbor" or "Switch") instead of the device id
+- start_upload records which client uploaded (`X-OpenPak-Client`) so the website can say Harbor
+
 ## v0.4.0 — 2026-10-08
 
 - breaking: the emulator save API is retired; `PUT`/`GET /internal/accounts/{account}/saves/{platform}/{title}` answer 410 Gone with a JSON reason

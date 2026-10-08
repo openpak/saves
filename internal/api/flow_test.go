@@ -158,6 +158,35 @@ func TestFlow(t *testing.T) {
 	if kept != store.Keep {
 		t.Fatalf("retention kept %d, want %d", kept, store.Keep)
 	}
+	// Deleting a title removes all its backups, and the version rows list no device id.
+	for _, sv := range list.Saves {
+		for _, ver := range sv.Versions {
+			if ver.Console != "Switch" {
+				t.Fatalf("a backup without a client is a Switch's, got %q", ver.Console)
+			}
+		}
+	}
+	resp = do("DELETE", base+"/saves/switch/0100ffff", nil, nil)
+	var delAll struct {
+		Deleted int `json:"deleted"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&delAll)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || delAll.Deleted != store.Keep {
+		t.Fatalf("delete title: %d %+v", resp.StatusCode, delAll)
+	}
+	if resp := do("DELETE", base+"/saves/switch/0100ffff", nil, nil); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("deleting a title with no backups: %d, want 404", resp.StatusCode)
+	}
+	resp = do("GET", base+"/saves", nil, nil)
+	list.Saves = nil
+	_ = json.NewDecoder(resp.Body).Decode(&list)
+	resp.Body.Close()
+	for _, sv := range list.Saves {
+		if sv.TitleID == "0100ffff" {
+			t.Fatalf("a deleted title is still listed: %+v", sv)
+		}
+	}
 
 	// Console: start_upload -> create component -> PUT blob (signed URL) -> finish -> list -> download.
 	sw := map[string]string{"X-OpenPak-Account": acct, "X-OpenPak-NSA": "nsa1", "X-OpenPak-Device": "dev1"}
@@ -495,7 +524,7 @@ func TestConsoleListOnlyConsoleArchives(t *testing.T) {
 	defer srv.Close()
 	acct := fmt.Sprintf("acct-console-%d", os.Getpid())
 	title := "0100aaaa0000bbbb"
-	sw := map[string]string{"X-OpenPak-Account": acct, "X-OpenPak-NSA": "00000000000000aa", "X-OpenPak-Device": "0000000000000001"}
+	sw := map[string]string{"X-OpenPak-Account": acct, "X-OpenPak-NSA": "00000000000000aa", "X-OpenPak-Device": "0000000000000001", "X-OpenPak-Client": "harbor/1.0 (linux)"}
 	do := func(method, path, body string, hdr map[string]string) (int, []byte) {
 		req, _ := http.NewRequest(method, srv.URL+path, strings.NewReader(body))
 		req.Header.Set("X-Internal-Key", "internal")
@@ -662,6 +691,19 @@ func TestConsoleListOnlyConsoleArchives(t *testing.T) {
 	}
 	if _, ok := rec["component_files"]; ok {
 		t.Fatalf("the list carries no component_files: %v", rec)
+	}
+
+	// The website sees it with a console label and no device id, and deleting the title there
+	// takes it out of the console's list.
+	code, b = do("GET", "/internal/accounts/"+acct+"/saves", "", nil)
+	if strings.Contains(string(b), "0000000000000001") || strings.Contains(string(b), `"device"`) || !strings.Contains(string(b), `"console":"Harbor"`) {
+		t.Fatalf("website listing: %d %s", code, b)
+	}
+	if code, b := do("DELETE", "/internal/accounts/"+acct+"/saves/switch/"+title, "", nil); code != 200 {
+		t.Fatalf("delete title: %d %s", code, b)
+	}
+	if l := list(); len(l) != 0 {
+		t.Fatalf("a deleted archive is still in the console's list: %v", l)
 	}
 }
 

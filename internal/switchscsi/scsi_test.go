@@ -2,6 +2,7 @@ package switchscsi
 
 import (
 	"encoding/base64"
+	"strings"
 	"testing"
 )
 
@@ -43,6 +44,14 @@ func TestComplete(t *testing.T) {
 		spoil(a)
 		if complete(a) {
 			t.Errorf("%s: an incomplete archive would reach the console", name)
+		}
+	}
+}
+
+func TestClientToken(t *testing.T) {
+	for in, want := range map[string]string{"harbor/1.2 (linux)": "harbor", "  Harbor ": "harbor", "": "", "a b": "", "evil<script>": "", strings.Repeat("x", 40): ""} {
+		if got := clientToken(in); got != want {
+			t.Errorf("clientToken(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

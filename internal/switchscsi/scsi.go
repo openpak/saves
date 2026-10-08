@@ -200,6 +200,23 @@ func metaStr(m map[string]any, k string) string {
 	return s
 }
 
+// clientToken is the client name in an X-OpenPak-Client value ("harbor/1.0 (linux)"): a short
+// lower-case token, or "" for anything else. It is stored to say Harbor from Switch on the
+// website, nothing more.
+func clientToken(v string) string {
+	name, _, _ := strings.Cut(strings.TrimSpace(v), "/")
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" || len(name) > 32 {
+		return ""
+	}
+	for _, r := range name {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '_') {
+			return ""
+		}
+	}
+	return name
+}
+
 // isConsole is whether a version was made through the console protocol. A restored console
 // version keeps its meta, so it stays one.
 func isConsole(v *store.Version) bool { return metaStr(v.Meta, "origin") == originConsole }
@@ -598,6 +615,10 @@ func (s *Server) startUpload(ctx context.Context, w http.ResponseWriter, r *http
 		meta = map[string]any{}
 	}
 	meta["device_id"], meta["device_serial"], meta["origin"] = c.device, "", originConsole
+	delete(meta, "client") // set from the header only, never from the body
+	if cl := clientToken(r.Header.Get("X-OpenPak-Client")); cl != "" {
+		meta["client"] = cl
+	}
 	delete(meta, "encoded_key_seed")
 	delete(meta, "encoded_mac")
 	if prev != nil {
