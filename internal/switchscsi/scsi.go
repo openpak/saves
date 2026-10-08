@@ -34,6 +34,10 @@ const (
 	urlTTL        = time.Hour
 	metaIndex     = 0
 	saveIndexBase = 4096
+	// originConsole marks, in a version's meta, a backup made through this protocol
+	// (start_upload … finish_upload). The same account and title also hold the emulator API's
+	// zips under platform "switch"; those are never console archives (olsc-findings §6.1.10).
+	originConsole = "console"
 )
 
 type Server struct {
@@ -64,9 +68,16 @@ func out(w http.ResponseWriter, code int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// nintendoErr is the error shape the console reads (the adapter uses the same one).
-func nintendoErr(w http.ResponseWriter, code int, kind, title, detail string) {
-	out(w, code, map[string]any{"errorCode": kind, "title": title, "detail": detail, "status": code})
+// nintendoErr answers an error. The console reads only "code", four ASCII digits mapped to
+// 2179-40xx (23.0.1 sysmodule 0x1dedb0); an archive endpoint answering without one fails its
+// required-field check first and shows 2179-3201. "0001" is "no such archive", which GET
+// archive reads as an empty result. The other fields are for people reading logs.
+func nintendoErr(w http.ResponseWriter, status int, kind, title, detail string) {
+	code := "0000"
+	if status == http.StatusNotFound {
+		code = "0001"
+	}
+	out(w, status, map[string]any{"code": code, "errorCode": kind, "title": title, "detail": detail, "status": status})
 }
 
 // mustPost refuses anything but POST on the action routes: an upload URL or a stray GET must
@@ -189,6 +200,32 @@ func metaStr(m map[string]any, k string) string {
 	return s
 }
 
+// isConsole is whether a version was made through the console protocol. A restored console
+// version keeps its meta, so it stays one.
+func isConsole(v *store.Version) bool { return metaStr(v.Meta, "origin") == originConsole }
+
+// digest32 is encoded_digest as the 23.0.1 record check takes it: base64url without padding of
+// exactly 32 bytes (the commit id, LE u64, in a zeroed 32-byte buffer). A 32-byte value is
+// returned unchanged; a shorter one (an 8-byte commit id from older firmware) is zero-padded to
+// the same value a 23.x console would have sent; anything else is not a digest.
+func digest32(s string) (string, bool) {
+	b, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(s, "="))
+	switch {
+	case err != nil || len(b) == 0 || len(b) > 32:
+		return s, false
+	case len(b) == 32 && !strings.HasSuffix(s, "="):
+		return s, true
+	}
+	return base64.RawURLEncoding.EncodeToString(append(b, make([]byte, 32-len(b))...)), true
+}
+
+// complete is the console's record check (0x1dd580): the struct always carries every key, so
+// what can still fail is the status, the digest and the two ids.
+func complete(a *archive) bool {
+	_, ok := digest32(a.EncodedDigest)
+	return ok && (a.Status == "fixed" || a.Status == "uploading") && a.NsaID != "" && a.ApplicationID != ""
+}
+
 func (s *Server) archiveOf(v *store.Version, sv *store.Save, c caller, withParts bool) *archive {
 	m := v.Meta
 	a := &archive{
@@ -198,6 +235,7 @@ func (s *Server) archiveOf(v *store.Version, sv *store.Save, c caller, withParts
 		AcdIndex: int(metaInt(m, "acd_index")), EncodedDigest: metaStr(m, "encoded_digest"), SavedAt: metaInt(m, "saved_at_as_unixtime"),
 		ComponentFiles: []*component{},
 	}
+	a.EncodedDigest, _ = digest32(a.EncodedDigest)
 	if d, ok := m["desc"].(string); ok {
 		a.Desc = &d
 	}
@@ -375,13 +413,26 @@ func (s *Server) archives(ctx context.Context, w http.ResponseWriter, r *http.Re
 			return
 		}
 		var in struct {
-			MAC string `json:"encoded_mac"`
+			KeySeed string `json:"encoded_key_seed"`
+			MAC     string `json:"encoded_mac"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&in)
 		if v.Status != store.Uploading {
 			// A retried finish answers with the archive it already fixed instead of running
 			// retention, and dropping parts, a second time.
 			out(w, 200, map[string]any{"save_data_archive": s.archiveOf(v, sv, c, true)})
+			return
+		}
+		// A full upload sends the exporter's key seed and MAC; a delta sends the MAC alone and
+		// keeps its series' seed. generate_key_seed_package will wrap both (§6.1.3, §6.1.4).
+		if in.KeySeed == "" {
+			if prev, err := s.Svc.Store.Version(ctx, metaInt(v.Meta, "previous_id")); err == nil {
+				in.KeySeed = metaStr(prev.Meta, "encoded_key_seed")
+			}
+		}
+		v.Meta["encoded_key_seed"], v.Meta["encoded_mac"] = in.KeySeed, in.MAC
+		if err := s.Svc.Store.SetMeta(ctx, v.ID, v.Meta); err != nil {
+			nintendoErr(w, http.StatusInternalServerError, "internal_server_error", "Internal error", err.Error())
 			return
 		}
 		live, gone, err := s.Svc.Store.Finish(ctx, v.ID, "")
@@ -414,7 +465,7 @@ func (s *Server) archives(ctx context.Context, w http.ResponseWriter, r *http.Re
 		}
 		s.Svc.DeleteBlobs(ctx, c.account, *gone)
 		s.Svc.Store.Audit(ctx, c.account, "switch_delete", map[string]any{"title": sv.TitleID, "version": v.Number, "force": r.URL.Query().Get("force")})
-		log.Printf("[scsi] delete account=%s title=%s archive=%d force=%s", c.account, sv.TitleID, v.ID, r.URL.Query().Get("force"))
+		log.Printf("[scsi] delete title=%s archive=%d force=%s", sv.TitleID, v.ID, r.URL.Query().Get("force"))
 		out(w, 200, map[string]any{"save_data_archive": a})
 	case "component_files":
 		if !ok {
@@ -439,6 +490,10 @@ func (s *Server) archives(ctx context.Context, w http.ResponseWriter, r *http.Re
 // not-found shape itself.
 func (s *Server) owned(ctx context.Context, w http.ResponseWriter, c caller, id int64) (*store.Version, *store.Save, bool) {
 	v, err := s.Svc.Store.Version(ctx, id)
+	if err == nil && !isConsole(v) {
+		// An emulator-API version is not an archive the console can know about.
+		err = store.ErrNotFound
+	}
 	if err == nil {
 		var saves []store.Save
 		saves, err = s.Svc.Store.Saves(ctx, c.account)
@@ -466,7 +521,12 @@ func (s *Server) list(ctx context.Context, w http.ResponseWriter, r *http.Reques
 		nintendoErr(w, http.StatusInternalServerError, "internal_server_error", "Internal error", err.Error())
 		return
 	}
-	list := []*archive{}
+	// listed hides component_files: the list carries none (docs/provenance.md, C and N).
+	type listed struct {
+		*archive
+		ComponentFiles *int `json:"component_files,omitempty"`
+	}
+	list := []listed{}
 	for i := range saves {
 		sv := &saves[i]
 		if sv.Platform != Platform || (q.Get("application_id") != "" && !strings.EqualFold(q.Get("application_id"), sv.TitleID)) {
@@ -478,12 +538,20 @@ func (s *Server) list(ctx context.Context, w http.ResponseWriter, r *http.Reques
 			return
 		}
 		for i := range vs {
+			if !isConsole(&vs[i]) {
+				continue
+			}
 			a := s.archiveOf(&vs[i], sv, c, false)
 			if dt := q.Get("datatype"); dt != "" && dt != strconv.Itoa(a.Datatype) {
 				continue
 			}
-			a.ComponentFiles = nil
-			list = append(list, a)
+			// One incomplete record makes the console refuse the whole list (2179-3201), so
+			// it is left out rather than sent.
+			if !complete(a) {
+				log.Printf("[scsi] list: archive=%d left out, incomplete for the console", a.ID)
+				continue
+			}
+			list = append(list, listed{archive: a})
 		}
 	}
 	out(w, 200, map[string]any{"save_data_archives": list})
@@ -532,7 +600,9 @@ func (s *Server) startUpload(ctx context.Context, w http.ResponseWriter, r *http
 	if meta == nil {
 		meta = map[string]any{}
 	}
-	meta["device_id"], meta["device_serial"] = c.device, ""
+	meta["device_id"], meta["device_serial"], meta["origin"] = c.device, "", originConsole
+	delete(meta, "encoded_key_seed")
+	delete(meta, "encoded_mac")
 	if prev != nil {
 		meta["previous_id"] = prev.ID
 		if meta["device_id"] == "" {
@@ -580,7 +650,7 @@ func (s *Server) startUpload(ctx context.Context, w http.ResponseWriter, r *http
 			}
 		}
 	}
-	log.Printf("[scsi] start_upload account=%s title=%s version=%d backend=%s parts=%d conflict=%v", c.account, title, v.Number, loc.Backend, len(v.Parts), v.Conflict)
+	log.Printf("[scsi] start_upload title=%s version=%d backend=%s parts=%d conflict=%v", title, v.Number, loc.Backend, len(v.Parts), v.Conflict)
 	out(w, http.StatusCreated, map[string]any{"save_data_archive": a})
 }
 
@@ -595,10 +665,20 @@ func (s *Server) createComponent(ctx context.Context, w http.ResponseWriter, r *
 	if in.Datatype == "" {
 		in.Datatype = "save"
 	}
-	p, err := s.Svc.Store.AddPart(ctx, v.ID, in.Index, in.Datatype, service.Key(c.account, Platform, sv.TitleID, v.ID, in.Index))
-	if err != nil {
-		nintendoErr(w, http.StatusInternalServerError, "internal_server_error", "Internal error", err.Error())
-		return
+	// The console creates every index itself, meta included, whatever start_upload already
+	// listed (§6.1.2): an index this archive has is answered, not added a second time.
+	var p *store.Part
+	for i := range v.Parts {
+		if v.Parts[i].Index == in.Index {
+			p = &v.Parts[i]
+		}
+	}
+	if p == nil {
+		var err error
+		if p, err = s.Svc.Store.AddPart(ctx, v.ID, in.Index, in.Datatype, service.Key(c.account, Platform, sv.TitleID, v.ID, in.Index)); err != nil {
+			nintendoErr(w, http.StatusInternalServerError, "internal_server_error", "Internal error", err.Error())
+			return
+		}
 	}
 	cf := componentOf(*p)
 	cf.PutURL = s.putURL(ctx, c, v, p)

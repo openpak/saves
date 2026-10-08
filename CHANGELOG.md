@@ -3,6 +3,15 @@
 Generated from git history on 2026-09-15. `git log` stays the source
 of truth; this file is the readable summary.
 
+## v0.3.1 — 2026-10-08
+
+- scsi: the console list holds only archives made through the console protocol; emulator-API saves are no longer sent as incomplete console records (one made firmware 23.0.1 refuse the whole list, 2179-3201)
+- scsi: listed records are complete for the 23.0.1 record check (32-byte `encoded_digest`, no `component_files`); an older 8-byte digest is zero-padded
+- scsi: error bodies carry the console's `code` (`0001` = no such archive)
+- scsi: `component_files/create` answers an index the archive already has instead of adding it twice
+- scsi: `finish_upload` keeps `encoded_key_seed` and `encoded_mac` (a delta keeps its series' seed)
+- scsi: no account ids in log lines
+
 ## v0.3.0 — 2026-09-16
 
 - scsi: v2 and v3 prefixes, POST-only actions, and a fixed archive that stays fixed

@@ -547,3 +547,154 @@ func TestWiiUFlow(t *testing.T) {
 		t.Fatalf("listing lost a platform: %+v", list.Saves)
 	}
 }
+
+// The console list is console archives only (olsc-findings §6.1.10): an account whose only
+// Switch saves came through the emulator API sees an empty cloud, a console upload made next
+// to them is listed alone and whole, and the emulator API still serves its own zips.
+func TestConsoleListOnlyConsoleArchives(t *testing.T) {
+	dbURL := requireDB(t)
+	st, err := store.Open(dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	local, _ := blob.NewLocal(t.TempDir())
+	svc := &service.Service{Store: st, Local: local, Allowance: 1 << 20, CredentialKey: []byte("k"), URLKey: []byte("u"),
+		UploadHost: "up.test", DownloadHost: "down.test"}
+	mux := http.NewServeMux()
+	(&api.Server{Svc: svc, Key: "internal"}).Register(mux)
+	(&switchscsi.Server{Svc: svc}).Register(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	acct := fmt.Sprintf("acct-console-%d", os.Getpid())
+	title := "0100aaaa0000bbbb"
+	sw := map[string]string{"X-OpenPak-Account": acct, "X-OpenPak-NSA": "00000000000000aa", "X-OpenPak-Device": "0000000000000001"}
+	do := func(method, path, body string, hdr map[string]string) (int, []byte) {
+		req, _ := http.NewRequest(method, srv.URL+path, strings.NewReader(body))
+		req.Header.Set("X-Internal-Key", "internal")
+		for k, v := range hdr {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, b
+	}
+	list := func() []map[string]any {
+		code, b := do("GET", "/scsi/api/console/v3/save_data_archives?datatype=0&application_id="+title, "", sw)
+		var l struct {
+			A []map[string]any `json:"save_data_archives"`
+		}
+		if err := json.Unmarshal(b, &l); code != 200 || err != nil || l.A == nil {
+			t.Fatalf("list: %d %s", code, b)
+		}
+		return l.A
+	}
+
+	// Emulator saves only: the console's cloud is empty, and their ids are not archives.
+	var emu api.VersionJSON
+	for i := 0; i < 3; i++ {
+		code, b := do("PUT", "/internal/accounts/"+acct+"/saves/switch/"+title, "zip-bytes", nil)
+		if code != 201 {
+			t.Fatalf("emulator upload: %d %s", code, b)
+		}
+		_ = json.Unmarshal(b, &emu)
+	}
+	if l := list(); len(l) != 0 {
+		t.Fatalf("emulator saves listed as console archives: %v", l)
+	}
+	code, b := do("GET", fmt.Sprintf("/scsi/api/console/v3/save_data_archives/%d", emu.ID), "", sw)
+	var e struct {
+		Code string `json:"code"`
+	}
+	if _ = json.Unmarshal(b, &e); code != 404 || e.Code != "0001" {
+		t.Fatalf("an emulator version must be 'no such archive' (0001) to the console: %d %s", code, b)
+	}
+	if code, _ := do("POST", fmt.Sprintf("/scsi/api/console/v3/save_data_archives/%d/start_download", emu.ID), "", sw); code != 404 {
+		t.Fatalf("an emulator version must not download through the console protocol: %d", code)
+	}
+
+	// The emulator API is unchanged: its newest Switch save is still its own zip.
+	if code, b := do("GET", "/internal/accounts/"+acct+"/saves/switch/"+title, "", nil); code != 200 || string(b) != "zip-bytes" {
+		t.Fatalf("emulator download: %d %q", code, b)
+	}
+
+	// A full console upload. The console creates index 0 itself although start_upload listed it.
+	digest := "AQIDBAUGBwgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	code, b = do("POST", "/scsi/api/console/v3/save_data_archives/start_upload",
+		`{"application_id":"`+title+`","datatype":0,"data_size":16,"saved_at_as_unixtime":1783207776,"launch_required_version":0,"series_id":42,"encoded_digest":"`+digest+`","desc":null,"auto_backup":false,"acd_index":0}`, sw)
+	var started struct {
+		A struct {
+			ID    int64 `json:"id"`
+			Comps []struct {
+				ID int64 `json:"id"`
+			} `json:"component_files"`
+		} `json:"save_data_archive"`
+	}
+	if _ = json.Unmarshal(b, &started); code != 201 || len(started.A.Comps) != 1 {
+		t.Fatalf("start_upload: %d %s", code, b)
+	}
+	aid := fmt.Sprint(started.A.ID)
+	if l := list(); len(l) != 0 {
+		t.Fatalf("an uploading archive is not in the fixed list: %v", l)
+	}
+	for _, c := range []struct {
+		body, bytes string
+	}{{`{"index":0,"datatype":"meta"}`, "meta-bytes"}, {`{"index":4096,"datatype":"save"}`, "chunk"}} {
+		code, b := do("POST", "/scsi/api/console/v3/save_data_archives/"+aid+"/component_files/create", c.body, sw)
+		var cf struct {
+			C struct {
+				ID     int64  `json:"id"`
+				PutURL string `json:"put_url"`
+			} `json:"component_file"`
+		}
+		if _ = json.Unmarshal(b, &cf); code != 201 || !strings.HasPrefix(cf.C.PutURL, "https://") {
+			t.Fatalf("create %s: %d %s", c.body, code, b)
+		}
+		if strings.Contains(c.body, `"index":0`) && cf.C.ID != started.A.Comps[0].ID {
+			t.Fatalf("index 0 created a second meta part (%d, start_upload had %d)", cf.C.ID, started.A.Comps[0].ID)
+		}
+		pu, _ := url.Parse(cf.C.PutURL)
+		if code, _ := do("PUT", "/scsi"+pu.Path+"?"+pu.RawQuery, c.bytes, nil); code != 200 {
+			t.Fatalf("blob put: %d", code)
+		}
+		if code, b := do("POST", fmt.Sprintf("/scsi/api/console/v3/component_files/%d/finish_upload", cf.C.ID),
+			fmt.Sprintf(`{"archive_size":%d,"encoded_archive_digest":"x"}`, len(c.bytes)), sw); code != 200 {
+			t.Fatalf("component finish: %d %s", code, b)
+		}
+	}
+	if code, b := do("POST", "/scsi/api/console/v3/save_data_archives/"+aid+"/finish_upload", `{"encoded_key_seed":"c2VlZA","encoded_mac":"bWFj"}`, sw); code != 200 {
+		t.Fatalf("finish_upload: %d %s", code, b)
+	}
+	v, err := st.Version(context.Background(), started.A.ID)
+	if err != nil || v.Meta["encoded_key_seed"] != "c2VlZA" || v.Meta["encoded_mac"] != "bWFj" {
+		t.Fatalf("finish_upload must keep the key seed and MAC: %v %v", err, v)
+	}
+
+	// Listed alone, and as complete as the 23.0.1 record check wants it.
+	l := list()
+	if len(l) != 1 {
+		t.Fatalf("want the one console archive, got %v", l)
+	}
+	rec := l[0]
+	for _, k := range []string{"id", "nsa_id", "application_id", "device_id", "datatype", "data_size", "status", "device_serial",
+		"num_of_partitions", "launch_required_version", "previous_save_data_archive_id", "series_id", "encoded_digest", "desc",
+		"saved_at_as_unixtime", "finished_at_as_unixtime"} {
+		val, ok := rec[k]
+		if !ok {
+			t.Errorf("listed archive lacks %q", k)
+		}
+		if val == nil && k != "desc" && k != "previous_save_data_archive_id" && k != "finished_at_as_unixtime" {
+			t.Errorf("listed archive has %q null", k)
+		}
+	}
+	if rec["status"] != "fixed" || rec["encoded_digest"] != digest || rec["finished_at_as_unixtime"] == nil {
+		t.Fatalf("listed archive: %v", rec)
+	}
+	if _, ok := rec["component_files"]; ok {
+		t.Fatalf("the list carries no component_files: %v", rec)
+	}
+}
