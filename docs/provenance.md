@@ -263,3 +263,21 @@ Citron (earlier build) pulls `GET /api/save/<title hex>` at launch (204 = nothin
 and pushes `POST /api/save/<title hex>` with the raw save as the body, bearer = the account
 token. That is the whole emulator contract Reference offers: newest wins, no versions, no
 conflict. Evidence for what a client will do, not a design to keep.
+
+## One history per title, two formats
+
+Console archives (made through the console upload protocol, marked `origin: console` in the
+version's meta) and emulator saves (the emulator API's single-part zips) live under the same
+save record, platform `switch`, so a title has one history across every device. Two rules keep
+the formats from getting in each other's way:
+
+- retention keeps the last 10 live, unpinned versions of each kind, not of the two together;
+- the emulator API's newest save is the newest emulator-format version, and the console list
+  holds console archives only.
+
+Continuity across formats is not the server's job and will not be: converting an emulator save
+into a console archive (or back) needs the user's console keys, which the server never has. The
+plan is for clients that do hold the user's keys, Harbor first, to convert: Harbor reads the
+newest console archive, decrypts it and writes an emulator save as a new version, and takes the
+newest emulator save, encrypts it and uploads it through the console protocol as a new archive.
+The server only stores and lists both kinds in the one history. Not built yet.

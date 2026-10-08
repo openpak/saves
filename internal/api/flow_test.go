@@ -698,3 +698,97 @@ func TestConsoleListOnlyConsoleArchives(t *testing.T) {
 		t.Fatalf("the list carries no component_files: %v", rec)
 	}
 }
+
+// Console archives and emulator saves share one history per title, but retention counts each
+// kind on its own and the emulator's newest save is never a console archive.
+func TestKindsShareHistoryNotRetention(t *testing.T) {
+	dbURL := requireDB(t)
+	st, err := store.Open(dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	local, _ := blob.NewLocal(t.TempDir())
+	svc := &service.Service{Store: st, Local: local, Allowance: 1 << 20, CredentialKey: []byte("k"), URLKey: []byte("u")}
+	mux := http.NewServeMux()
+	(&api.Server{Svc: svc, Key: "internal"}).Register(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	ctx := context.Background()
+	acct := fmt.Sprintf("acct-kinds-%d", os.Getpid())
+	title := "0100kinds00000000"
+	sv, err := st.EnsureSave(ctx, acct, "switch", title)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loc := store.Location{Backend: blob.Local, ID: blob.Local}
+	add := func(meta map[string]any) *store.Version {
+		v, err := st.NewVersion(ctx, sv.ID, nil, "dev", loc, meta, 0, nil, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		live, _, err := st.Finish(ctx, v.ID, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return live
+	}
+	console := map[string]any{"origin": "console"}
+	var first *store.Version
+	for i := 0; i < 3; i++ {
+		v := add(console)
+		if first == nil {
+			first = v
+		}
+	}
+	// A run of emulator uploads well past Keep must not take the console archives.
+	for i := 0; i < store.Keep+5; i++ {
+		add(nil)
+	}
+	live := func() (c, e int) {
+		vs, err := st.Versions(ctx, sv.ID, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, v := range vs {
+			if v.Meta["origin"] == "console" {
+				c++
+			} else {
+				e++
+			}
+		}
+		return
+	}
+	if c, e := live(); c != 3 || e != store.Keep {
+		t.Fatalf("after emulator uploads: %d console, %d emulator live; want 3 and %d", c, e, store.Keep)
+	}
+	// And the other way: more console archives than Keep leave every emulator save alone.
+	for i := 0; i < store.Keep+2; i++ {
+		add(console)
+	}
+	if c, e := live(); c != store.Keep || e != store.Keep {
+		t.Fatalf("after console uploads: %d console, %d emulator live; want %d each", c, e, store.Keep)
+	}
+	// The newest version overall is a console archive; the emulator API must not return it.
+	last := add(console)
+	cur, err := st.Newest(ctx, sv.ID)
+	if err != nil || cur.Meta["origin"] == "console" || cur.ID == last.ID {
+		t.Fatalf("newest emulator save is a console archive or missing: %+v %v", cur, err)
+	}
+	// An account with console archives only has no emulator save to hand out.
+	only, _ := st.EnsureSave(ctx, acct, "switch", "0100consoleonly000")
+	v, _ := st.NewVersion(ctx, only.ID, nil, "dev", loc, console, 0, nil, 0, 0)
+	if _, _, err := st.Finish(ctx, v.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest("GET", srv.URL+"/internal/accounts/"+acct+"/saves/switch/0100consoleonly000", nil)
+	req.Header.Set("X-Internal-Key", "internal")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("console-only title: emulator newest answered %d, want 204", resp.StatusCode)
+	}
+}

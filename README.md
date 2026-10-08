@@ -16,7 +16,7 @@ a server-minted key seed package (milestone M0) is not yet known, and the log li
 | Piece | Where |
 | --- | --- |
 | `cmd/saves` | the service: `/internal/*` for the website, `/scsi/*` for the Switch adapter, `/healthz` |
-| `internal/store` | Postgres: saves, versions, parts, storage settings, audit; retention (last 10 + pinned) |
+| `internal/store` | Postgres: saves, versions, parts, storage settings, audit; retention (last 10 of each kind + pinned) |
 | `internal/blob` | backends: `local` (the allowance, a directory) and `s3` (the player's bucket, presigned URLs); sealed credentials |
 | `internal/switchscsi` | the console's archives and component files over the same index |
 | `internal/api` | the internal HTTP API |

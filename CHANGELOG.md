@@ -3,6 +3,11 @@
 Generated from git history on 2026-09-15. `git log` stays the source
 of truth; this file is the readable summary.
 
+## v0.3.2 — 2026-10-08
+
+- retention keeps the last 10 versions of each kind (console archives, emulator saves) per title, so neither pushes the other out
+- the emulator API's newest save is the newest emulator-format save, never a console archive
+
 ## v0.3.1 — 2026-10-08
 
 - scsi: the console list holds only archives made through the console protocol; emulator-API saves are no longer sent as incomplete console records (one made firmware 23.0.1 refuse the whole list, 2179-3201)

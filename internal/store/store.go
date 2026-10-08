@@ -327,14 +327,21 @@ func (s *Store) Versions(ctx context.Context, saveID int64, all bool) ([]Version
 	return vs, nil
 }
 
-// Newest is the current live version of a save, or ErrNotFound: the newest live version that
-// is not a conflict, because a conflict is a divergence waiting for the player and not the
-// progress to hand the next device. If every live version is a conflict, the newest of them is
-// still the best answer there is.
+// Newest is the current live emulator-format version of a save, or ErrNotFound: the newest
+// live version that is not a conflict, because a conflict is a divergence waiting for the
+// player and not the progress to hand the next device. If every live version is a conflict,
+// the newest of them is still the best answer there is. Console archives share the save's
+// history but are not what an emulator can load, so they are never the answer.
 func (s *Store) Newest(ctx context.Context, saveID int64) (*Version, error) {
-	vs, err := s.Versions(ctx, saveID, false)
+	all, err := s.Versions(ctx, saveID, false)
 	if err != nil {
 		return nil, err
+	}
+	var vs []Version
+	for _, v := range all {
+		if o, _ := v.Meta["origin"].(string); o != "console" {
+			vs = append(vs, v)
+		}
 	}
 	if len(vs) == 0 {
 		return nil, ErrNotFound
@@ -439,11 +446,17 @@ func (s *Store) Finish(ctx context.Context, id int64, sha256 string) (*Version, 
 	return v, gone, nil
 }
 
-// prune is retention: everything live, unpinned and beyond the newest Keep goes. A conflict
-// is never pruned automatically — it is the one copy of progress nobody has looked at yet.
+// prune is retention: everything live, unpinned and beyond the newest Keep of its kind goes.
+// The kinds are console archives (meta origin "console") and emulator saves; they share one
+// history per title but not one allowance of versions, so a run of one never pushes the other
+// out. A conflict is never pruned automatically — it is the one copy of progress nobody has
+// looked at yet.
 func prune(ctx context.Context, tx *sql.Tx, saveID int64) ([]int64, error) {
 	rows, err := tx.QueryContext(ctx, `UPDATE versions SET status='deleted' WHERE id IN (
-		SELECT id FROM versions WHERE save_id=$1 AND status='live' AND NOT pinned AND NOT conflict ORDER BY number DESC OFFSET $2) RETURNING id`, saveID, Keep)
+		SELECT id FROM (
+			SELECT id, row_number() OVER (PARTITION BY coalesce(meta->>'origin','') = 'console' ORDER BY number DESC) AS rn
+			FROM versions WHERE save_id=$1 AND status='live' AND NOT pinned AND NOT conflict) k
+		WHERE rn > $2) RETURNING id`, saveID, Keep)
 	if err != nil {
 		return nil, err
 	}
