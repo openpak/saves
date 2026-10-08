@@ -35,8 +35,8 @@ const (
 	metaIndex     = 0
 	saveIndexBase = 4096
 	// originConsole marks, in a version's meta, a backup made through this protocol
-	// (start_upload … finish_upload). The same account and title also hold the emulator API's
-	// zips under platform "switch"; those are never console archives (olsc-findings §6.1.10).
+	// (start_upload … finish_upload). Versions without it are the retired emulator API's
+	// zips: hidden (status retired), never console archives (olsc-findings §6.1.10).
 	originConsole = "console"
 )
 
@@ -538,9 +538,6 @@ func (s *Server) list(ctx context.Context, w http.ResponseWriter, r *http.Reques
 			return
 		}
 		for i := range vs {
-			if !isConsole(&vs[i]) {
-				continue
-			}
 			a := s.archiveOf(&vs[i], sv, c, false)
 			if dt := q.Get("datatype"); dt != "" && dt != strconv.Itoa(a.Datatype) {
 				continue

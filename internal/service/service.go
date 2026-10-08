@@ -369,3 +369,39 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	c.n += int64(n)
 	return n, err
 }
+
+// PurgeRetired deletes every retired (emulator-era) version: the bytes from whichever backend
+// holds them, then the rows. It reports how many versions and bytes that was and how many
+// tombstones are left (a backend that was unavailable keeps its blobs, and the sweep retries).
+func (s *Service) PurgeRetired(ctx context.Context) (versions, bytes int64, left int, err error) {
+	if versions, bytes, err = s.Store.Retired(ctx); err != nil {
+		return
+	}
+	if _, err = s.Store.DeleteRetired(ctx); err != nil {
+		return
+	}
+	for {
+		dead, terr := s.Store.Tombstones(ctx, 200)
+		if terr != nil {
+			err = terr
+			return
+		}
+		if len(dead) == 0 {
+			break
+		}
+		for _, v := range dead {
+			s.DeleteBlobs(ctx, strings.SplitN(firstKey(v), "/", 2)[0], v)
+		}
+		after, terr := s.Store.Tombstones(ctx, 200)
+		if terr != nil {
+			err = terr
+			return
+		}
+		if len(after) >= len(dead) { // no progress: the rest waits for its backend
+			left = len(after)
+			break
+		}
+	}
+	_, err = s.Store.DropEmptySaves(ctx)
+	return
+}

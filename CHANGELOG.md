@@ -3,6 +3,13 @@
 Generated from git history on 2026-09-15. `git log` stays the source
 of truth; this file is the readable summary.
 
+## v0.4.0 — 2026-10-08
+
+- breaking: the emulator save API is retired; `PUT`/`GET /internal/accounts/{account}/saves/{platform}/{title}` answer 410 Gone with a JSON reason
+- the cloud holds console archives only; versions the old API stored are marked `retired` at start (hidden from lists, downloads, restore and the console)
+- `app purge-retired` deletes retired versions, their bytes and emptied save records
+- retention is again the plain last 10 per title (no per-kind split); the emulator "newest" is gone
+
 ## v0.3.2 — 2026-10-08
 
 - retention keeps the last 10 versions of each kind (console archives, emulator saves) per title, so neither pushes the other out

@@ -71,50 +71,77 @@ func TestFlow(t *testing.T) {
 		}
 		return resp
 	}
-	base := "/internal/accounts/" + acct
-
-	// Emulator: first upload, second from base 1, third from base 1 again -> conflict.
-	for i, b := range []string{"", "1", "1"} {
-		resp := do("PUT", base+"/saves/citron/0100abcd?base="+b, bytes.NewReader([]byte("save-"+b+fmt.Sprint(i))), nil)
-		if resp.StatusCode != 201 {
-			t.Fatalf("upload %d: %d", i, resp.StatusCode)
+	// The fixtures below are console archives (origin "console") made straight through the
+	// store, under their own account so the console list further down stays exactly one.
+	fx := acct + "-fx"
+	base := "/internal/accounts/" + fx
+	ctx := context.Background()
+	loc := store.Location{Backend: blob.Local, ID: blob.Local}
+	addVer := func(title string, baseNum *int, body string) *store.Version {
+		t.Helper()
+		sv, err := st.EnsureSave(ctx, fx, "switch", title)
+		if err != nil {
+			t.Fatal(err)
 		}
-		var v api.VersionJSON
-		_ = json.NewDecoder(resp.Body).Decode(&v)
+		v, err := st.NewVersion(ctx, sv.ID, baseNum, "dev", loc, map[string]any{"origin": "console"}, int64(len(body)), nil, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, err := st.AddPart(ctx, v.ID, 0, "save", service.Key(fx, "switch", title, v.ID, 0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, digest, err := svc.PutPart(ctx, local, p, strings.NewReader(body), int64(len(body)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.SetPartStatus(ctx, p.ID, store.Fixed, &n, digest); err != nil {
+			t.Fatal(err)
+		}
+		live, _, err := st.Finish(ctx, v.ID, digest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return live
+	}
+
+	// The emulator save API is retired: it stores nothing and serves nothing.
+	for _, m := range []string{"PUT", "GET"} {
+		resp := do(m, base+"/saves/citron/0100abcd", bytes.NewReader([]byte("save")), nil)
+		var gone struct {
+			Error string `json:"error"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&gone)
 		resp.Body.Close()
-		if i == 2 && !v.Conflict {
-			t.Fatal("a PUT from an old base must be flagged conflict")
-		}
-		if i == 1 && v.Conflict {
-			t.Fatal("a PUT from the current base is not a conflict")
+		if resp.StatusCode != http.StatusGone || gone.Error != api.RetiredReason {
+			t.Fatalf("emulator %s: %d %q, want 410 and the retired reason", m, resp.StatusCode, gone.Error)
 		}
 	}
-	// The third upload was flagged conflict, so it is kept but it is not what the next device
-	// gets: current is the newest version nobody diverged from.
-	resp := do("GET", base+"/saves/citron/0100abcd", nil, nil)
-	got, _ := io.ReadAll(resp.Body)
+	resp := do("GET", base+"/saves", nil, nil)
+	var empty struct {
+		Saves []api.SaveJSON `json:"saves"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&empty)
 	resp.Body.Close()
-	if resp.StatusCode != 200 || string(got) != "save-11" || resp.Header.Get("X-Save-Version") != "2" {
-		t.Fatalf("current: %d %q v=%s", resp.StatusCode, got, resp.Header.Get("X-Save-Version"))
-	}
-	if resp.Header.Get("X-Save-Conflict") != "false" {
-		t.Fatal("current must not be a conflict")
-	}
-	if resp := do("GET", base+"/saves/citron/nothing", nil, nil); resp.StatusCode != 204 {
-		t.Fatalf("missing save: %d", resp.StatusCode)
+	if len(empty.Saves) != 0 {
+		t.Fatalf("a retired upload left a save behind: %+v", empty.Saves)
 	}
 
-	// Allowance: 100 bytes; three small saves fit, a 200-byte one does not.
-	resp = do("PUT", base+"/saves/citron/0100abcd", bytes.NewReader(bytes.Repeat([]byte("x"), 200)), nil)
-	if resp.StatusCode != 507 {
-		t.Fatalf("over allowance: %d", resp.StatusCode)
+	// Versions of one archive series: second from base 1, third from base 1 again -> conflict.
+	one := 1
+	if v := addVer("0100abcd", nil, "save-0"); v.Conflict {
+		t.Fatal("a first version is not a conflict")
 	}
-	resp.Body.Close()
+	if v := addVer("0100abcd", &one, "save-11"); v.Conflict {
+		t.Fatal("a version from the current base is not a conflict")
+	}
+	if v := addVer("0100abcd", &one, "save-12"); !v.Conflict {
+		t.Fatal("a version from an old base must be flagged conflict")
+	}
 
-	// Retention: Keep+3 uploads leave Keep live.
+	// Retention: Keep+3 versions leave Keep live.
 	for i := 0; i < store.Keep+3; i++ {
-		resp := do("PUT", base+"/saves/citron/0100ffff", bytes.NewReader([]byte("v")), nil)
-		resp.Body.Close()
+		addVer("0100ffff", nil, "v")
 	}
 	resp = do("GET", base+"/saves", nil, nil)
 	var list struct {
@@ -122,10 +149,14 @@ func TestFlow(t *testing.T) {
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&list)
 	resp.Body.Close()
+	kept := 0
 	for _, sv := range list.Saves {
-		if sv.TitleID == "0100ffff" && len(sv.Versions) != store.Keep {
-			t.Fatalf("retention kept %d, want %d", len(sv.Versions), store.Keep)
+		if sv.TitleID == "0100ffff" {
+			kept = len(sv.Versions)
 		}
+	}
+	if kept != store.Keep {
+		t.Fatalf("retention kept %d, want %d", kept, store.Keep)
 	}
 
 	// Console: start_upload -> create component -> PUT blob (signed URL) -> finish -> list -> download.
@@ -274,24 +305,22 @@ func TestFlow(t *testing.T) {
 
 	// Two devices from the same base: neither is stale when it starts, the second one is by
 	// the time it commits, and the conflict is never what the next device downloads.
-	ctx := context.Background()
-	race, err := st.EnsureSave(ctx, acct, "citron", "0100race")
+	race, err := st.EnsureSave(ctx, fx, "switch", "0100race")
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := st.NewVersion(ctx, race.ID, nil, "d0", store.Location{Backend: blob.Local, ID: blob.Local}, nil, 0, nil, 0, 0)
+	first, err := st.NewVersion(ctx, race.ID, nil, "d0", loc, map[string]any{"origin": "console"}, 0, nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := st.Finish(ctx, first.ID, ""); err != nil {
 		t.Fatal(err)
 	}
-	one := 1
-	a, err := st.NewVersion(ctx, race.ID, &one, "d1", store.Location{Backend: blob.Local, ID: blob.Local}, nil, 0, nil, 0, 0)
+	a, err := st.NewVersion(ctx, race.ID, &one, "d1", loc, map[string]any{"origin": "console"}, 0, nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := st.NewVersion(ctx, race.ID, &one, "d2", store.Location{Backend: blob.Local, ID: blob.Local}, nil, 0, nil, 0, 0)
+	b, err := st.NewVersion(ctx, race.ID, &one, "d2", loc, map[string]any{"origin": "console"}, 0, nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,16 +338,13 @@ func TestFlow(t *testing.T) {
 	if !liveB.Conflict {
 		t.Fatal("an upload that was current when it started and stale when it committed must be a conflict")
 	}
-	if cur, err := st.Newest(ctx, race.ID); err != nil || cur.ID != liveA.ID {
-		t.Fatalf("current must be the newest non-conflict version, got %+v (%v)", cur, err)
-	}
 
 	// A console backup is several parts and leaves whole, as a zip named by component index.
-	multi, err := st.EnsureSave(ctx, acct, "switch", "0100multi")
+	multi, err := st.EnsureSave(ctx, fx, "switch", "0100multi")
 	if err != nil {
 		t.Fatal(err)
 	}
-	mv, err := st.NewVersion(ctx, multi.ID, nil, "dev1", store.Location{Backend: blob.Local, ID: blob.Local}, nil, 0, nil, 0, 0)
+	mv, err := st.NewVersion(ctx, multi.ID, nil, "dev1", loc, map[string]any{"origin": "console"}, 0, nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,7 +353,7 @@ func TestFlow(t *testing.T) {
 		kind string
 		body string
 	}{{0, "meta", "meta-bytes"}, {4096, "save", "partition-0"}} {
-		p, err := st.AddPart(ctx, mv.ID, part.idx, part.kind, service.Key(acct, "switch", "0100multi", mv.ID, part.idx))
+		p, err := st.AddPart(ctx, mv.ID, part.idx, part.kind, service.Key(fx, "switch", "0100multi", mv.ID, part.idx))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -420,19 +446,19 @@ func TestFlow(t *testing.T) {
 	if resp.StatusCode != 200 || restored.Version.Number != 4 || restored.Version.ID == conflictID {
 		t.Fatalf("restore must write a new version: %d %+v", resp.StatusCode, restored.Version)
 	}
-	resp = do("GET", base+"/saves/citron/0100abcd", nil, nil)
-	got, _ = io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if string(got) != "save-12" || resp.Header.Get("X-Save-Version") != "4" {
-		t.Fatalf("restored current: %q v=%s", got, resp.Header.Get("X-Save-Version"))
+	restoredBytes := func() string {
+		resp := do("GET", base+"/versions/"+fmt.Sprint(restored.Version.ID), nil, nil)
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return string(b)
+	}
+	if got := restoredBytes(); got != "save-12" {
+		t.Fatalf("restored version: %q", got)
 	}
 	if resp := do("DELETE", base+"/versions/"+fmt.Sprint(conflictID), nil, nil); resp.StatusCode != 204 {
 		t.Fatalf("deleting the version restored from: %d", resp.StatusCode)
 	}
-	resp = do("GET", base+"/saves/citron/0100abcd", nil, nil)
-	got, _ = io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if string(got) != "save-12" {
+	if got := restoredBytes(); got != "save-12" {
 		t.Fatalf("deleting the source took the restored version's bytes with it: %q", got)
 	}
 
@@ -449,108 +475,9 @@ func TestFlow(t *testing.T) {
 	}
 }
 
-// TestWiiUFlow pins the Wii U adapter contract (platform-wiiu-prd WU-2): the
-// family has no console-side cloud protocol of its own, so its surface is the
-// neutral API — today the emulator/website shape — and the store's platform
-// isolation rule CS-05 is what makes that safe: a Wii U save of a title and a
-// Switch save of the same title are two different saves, never one.
-func TestWiiUFlow(t *testing.T) {
-	dbURL := requireDB(t)
-	st, err := store.Open(dbURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	local, _ := blob.NewLocal(t.TempDir())
-	svc := &service.Service{Store: st, Local: local, Allowance: 100, CredentialKey: []byte("k"), URLKey: []byte("u"),
-		UploadHost: "up.test", DownloadHost: "down.test"}
-	mux := http.NewServeMux()
-	(&api.Server{Svc: svc, Key: "internal"}).Register(mux)
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-	acct := fmt.Sprintf("wiiu-acct-%d", os.Getpid())
-
-	do := func(method, path string, body io.Reader) *http.Response {
-		req, _ := http.NewRequest(method, srv.URL+path, body)
-		req.Header.Set("X-Internal-Key", "internal")
-		if b, ok := body.(*bytes.Reader); ok {
-			req.ContentLength = int64(b.Len())
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return resp
-	}
-	base := "/internal/accounts/" + acct
-
-	// Cemu's first upload, then a second one from that base (newest wins).
-	resp := do("PUT", base+"/saves/wiiu/0005000010145D00?device=cemu-1", bytes.NewReader([]byte("wiiu-save-1")))
-	if resp.StatusCode != 201 {
-		t.Fatalf("wiiu upload 1: %d", resp.StatusCode)
-	}
-	var v1 api.VersionJSON
-	_ = json.NewDecoder(resp.Body).Decode(&v1)
-	resp.Body.Close()
-	resp = do("PUT", base+"/saves/wiiu/0005000010145D00?base=1&device=cemu-1", bytes.NewReader([]byte("wiiu-save-2")))
-	if resp.StatusCode != 201 {
-		t.Fatalf("wiiu upload 2: %d", resp.StatusCode)
-	}
-	var v2 api.VersionJSON
-	_ = json.NewDecoder(resp.Body).Decode(&v2)
-	resp.Body.Close()
-	if v2.Conflict || v2.Number != 2 {
-		t.Fatalf("second wiiu upload must be the live version 2, got %+v", v2)
-	}
-
-	// Newest is the Wii U save.
-	resp = do("GET", base+"/saves/wiiu/0005000010145D00", nil)
-	got, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode != 200 || string(got) != "wiiu-save-2" || resp.Header.Get("X-Save-Version") != "2" {
-		t.Fatalf("wiiu newest: %d %q v=%s", resp.StatusCode, got, resp.Header.Get("X-Save-Version"))
-	}
-
-	// CS-05: the same title id on the switch platform is a different save.
-	resp = do("PUT", base+"/saves/switch/0005000010145D00", bytes.NewReader([]byte("switch-save")))
-	resp.Body.Close()
-	if resp.StatusCode != 201 {
-		t.Fatalf("switch upload: %d", resp.StatusCode)
-	}
-	resp = do("GET", base+"/saves/wiiu/0005000010145D00", nil)
-	got, _ = io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if string(got) != "wiiu-save-2" {
-		t.Fatalf("platforms leaked into each other: wiiu newest is %q", got)
-	}
-	resp = do("GET", base+"/saves/switch/0005000010145D00", nil)
-	got, _ = io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if string(got) != "switch-save" {
-		t.Fatalf("platforms leaked into each other: switch newest is %q", got)
-	}
-
-	// The listing carries the platform, so one account's page shows both.
-	resp = do("GET", base+"/saves", nil)
-	var list struct {
-		Saves []api.SaveJSON `json:"saves"`
-	}
-	_ = json.NewDecoder(resp.Body).Decode(&list)
-	resp.Body.Close()
-	platforms := map[string]string{}
-	for _, sv := range list.Saves {
-		if sv.TitleID == "0005000010145D00" {
-			platforms[sv.Platform] = sv.TitleID
-		}
-	}
-	if platforms["wiiu"] == "" || platforms["switch"] == "" {
-		t.Fatalf("listing lost a platform: %+v", list.Saves)
-	}
-}
-
 // The console list is console archives only (olsc-findings §6.1.10): an account whose only
-// Switch saves came through the emulator API sees an empty cloud, a console upload made next
-// to them is listed alone and whole, and the emulator API still serves its own zips.
+// Switch saves were stored by the retired emulator API sees an empty cloud, and a console
+// upload made next to them is listed alone and whole.
 func TestConsoleListOnlyConsoleArchives(t *testing.T) {
 	dbURL := requireDB(t)
 	st, err := store.Open(dbURL)
@@ -594,14 +521,58 @@ func TestConsoleListOnlyConsoleArchives(t *testing.T) {
 		return l.A
 	}
 
-	// Emulator saves only: the console's cloud is empty, and their ids are not archives.
-	var emu api.VersionJSON
+	// Emulator saves only, as the retired API left them: retired, so the console's cloud is
+	// empty and their ids are not archives. The API itself stores nothing new.
+	ctx := context.Background()
+	esv, err := st.EnsureSave(ctx, acct, "switch", title)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var emu *store.Version
 	for i := 0; i < 3; i++ {
-		code, b := do("PUT", "/internal/accounts/"+acct+"/saves/switch/"+title, "zip-bytes", nil)
-		if code != 201 {
-			t.Fatalf("emulator upload: %d %s", code, b)
+		v, err := st.NewVersion(ctx, esv.ID, nil, "dev", store.Location{Backend: blob.Local, ID: blob.Local}, nil, 9, nil, 0, 0)
+		if err != nil {
+			t.Fatal(err)
 		}
-		_ = json.Unmarshal(b, &emu)
+		p, _ := st.AddPart(ctx, v.ID, 0, "save", service.Key(acct, "switch", title, v.ID, 0))
+		n, digest, err := svc.PutPart(ctx, local, p, strings.NewReader("zip-bytes"), 9)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = st.SetPartStatus(ctx, p.ID, store.Fixed, &n, digest)
+		if emu, _, err = st.Finish(ctx, v.ID, digest); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n, err := st.RetireEmulatorSaves(ctx); err != nil || n < 3 {
+		t.Fatalf("retire: %d %v", n, err)
+	}
+	if n, err := st.RetireEmulatorSaves(ctx); err != nil || n != 0 {
+		t.Fatalf("retiring again must change nothing: %d %v", n, err)
+	}
+	if n, _, err := st.Retired(ctx); err != nil || n < 3 {
+		t.Fatalf("retired count: %d %v", n, err)
+	}
+	if code, _ := do("PUT", "/internal/accounts/"+acct+"/saves/switch/"+title, "zip-bytes", nil); code != http.StatusGone {
+		t.Fatalf("emulator upload: %d, want 410", code)
+	}
+	if code, _ := do("GET", "/internal/accounts/"+acct+"/saves/switch/"+title, "", nil); code != http.StatusGone {
+		t.Fatalf("emulator download: %d, want 410", code)
+	}
+	// Nothing reads them: not the website listing, not their version routes.
+	if code, b := do("GET", "/internal/accounts/"+acct+"/saves", "", nil); code != 200 || strings.Contains(string(b), title) {
+		t.Fatalf("a retired save is listed: %d %s", code, b)
+	}
+	for _, m := range []string{"GET", "DELETE"} {
+		if code, _ := do(m, fmt.Sprintf("/internal/accounts/%s/versions/%d", acct, emu.ID), "", nil); code != http.StatusNotFound {
+			t.Fatalf("%s of a retired version: %d, want 404", m, code)
+		}
+	}
+	if code, _ := do("POST", fmt.Sprintf("/internal/accounts/%s/versions/%d/restore", acct, emu.ID), "", nil); code != http.StatusNotFound {
+		t.Fatalf("restore of a retired version: %d, want 404", code)
+	}
+	if v, err := st.Version(ctx, emu.ID); err != nil || v.Status != store.Retired || len(v.Parts) != 1 {
+		t.Fatalf("a retired version must stay on record, parts and all: %+v %v", v, err)
 	}
 	if l := list(); len(l) != 0 {
 		t.Fatalf("emulator saves listed as console archives: %v", l)
@@ -615,11 +586,6 @@ func TestConsoleListOnlyConsoleArchives(t *testing.T) {
 	}
 	if code, _ := do("POST", fmt.Sprintf("/scsi/api/console/v3/save_data_archives/%d/start_download", emu.ID), "", sw); code != 404 {
 		t.Fatalf("an emulator version must not download through the console protocol: %d", code)
-	}
-
-	// The emulator API is unchanged: its newest Switch save is still its own zip.
-	if code, b := do("GET", "/internal/accounts/"+acct+"/saves/switch/"+title, "", nil); code != 200 || string(b) != "zip-bytes" {
-		t.Fatalf("emulator download: %d %q", code, b)
 	}
 
 	// A full console upload. The console creates index 0 itself although start_upload listed it.
@@ -699,9 +665,8 @@ func TestConsoleListOnlyConsoleArchives(t *testing.T) {
 	}
 }
 
-// Console archives and emulator saves share one history per title, but retention counts each
-// kind on its own and the emulator's newest save is never a console archive.
-func TestKindsShareHistoryNotRetention(t *testing.T) {
+// Purging deletes what the retired API stored: the rows, the bytes, the emptied save records.
+func TestPurgeRetired(t *testing.T) {
 	dbURL := requireDB(t)
 	st, err := store.Open(dbURL)
 	if err != nil {
@@ -710,85 +675,49 @@ func TestKindsShareHistoryNotRetention(t *testing.T) {
 	defer st.Close()
 	local, _ := blob.NewLocal(t.TempDir())
 	svc := &service.Service{Store: st, Local: local, Allowance: 1 << 20, CredentialKey: []byte("k"), URLKey: []byte("u")}
-	mux := http.NewServeMux()
-	(&api.Server{Svc: svc, Key: "internal"}).Register(mux)
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
 	ctx := context.Background()
-	acct := fmt.Sprintf("acct-kinds-%d", os.Getpid())
-	title := "0100kinds00000000"
-	sv, err := st.EnsureSave(ctx, acct, "switch", title)
-	if err != nil {
-		t.Fatal(err)
-	}
+	acct := fmt.Sprintf("acct-purge-%d", os.Getpid())
 	loc := store.Location{Backend: blob.Local, ID: blob.Local}
-	add := func(meta map[string]any) *store.Version {
-		v, err := st.NewVersion(ctx, sv.ID, nil, "dev", loc, meta, 0, nil, 0, 0)
+	mk := func(title string, meta map[string]any) (*store.Version, string) {
+		sv, _ := st.EnsureSave(ctx, acct, "switch", title)
+		v, err := st.NewVersion(ctx, sv.ID, nil, "dev", loc, meta, 4, nil, 0, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
-		live, _, err := st.Finish(ctx, v.ID, "")
+		p, _ := st.AddPart(ctx, v.ID, 0, "save", service.Key(acct, "switch", title, v.ID, 0))
+		n, digest, err := svc.PutPart(ctx, local, p, strings.NewReader("data"), 4)
 		if err != nil {
 			t.Fatal(err)
 		}
-		return live
-	}
-	console := map[string]any{"origin": "console"}
-	var first *store.Version
-	for i := 0; i < 3; i++ {
-		v := add(console)
-		if first == nil {
-			first = v
-		}
-	}
-	// A run of emulator uploads well past Keep must not take the console archives.
-	for i := 0; i < store.Keep+5; i++ {
-		add(nil)
-	}
-	live := func() (c, e int) {
-		vs, err := st.Versions(ctx, sv.ID, false)
+		_ = st.SetPartStatus(ctx, p.ID, store.Fixed, &n, digest)
+		live, _, err := st.Finish(ctx, v.ID, digest)
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, v := range vs {
-			if v.Meta["origin"] == "console" {
-				c++
-			} else {
-				e++
-			}
-		}
-		return
+		return live, p.Key
 	}
-	if c, e := live(); c != 3 || e != store.Keep {
-		t.Fatalf("after emulator uploads: %d console, %d emulator live; want 3 and %d", c, e, store.Keep)
-	}
-	// And the other way: more console archives than Keep leave every emulator save alone.
-	for i := 0; i < store.Keep+2; i++ {
-		add(console)
-	}
-	if c, e := live(); c != store.Keep || e != store.Keep {
-		t.Fatalf("after console uploads: %d console, %d emulator live; want %d each", c, e, store.Keep)
-	}
-	// The newest version overall is a console archive; the emulator API must not return it.
-	last := add(console)
-	cur, err := st.Newest(ctx, sv.ID)
-	if err != nil || cur.Meta["origin"] == "console" || cur.ID == last.ID {
-		t.Fatalf("newest emulator save is a console archive or missing: %+v %v", cur, err)
-	}
-	// An account with console archives only has no emulator save to hand out.
-	only, _ := st.EnsureSave(ctx, acct, "switch", "0100consoleonly000")
-	v, _ := st.NewVersion(ctx, only.ID, nil, "dev", loc, console, 0, nil, 0, 0)
-	if _, _, err := st.Finish(ctx, v.ID, ""); err != nil {
+	emu, emuKey := mk("0100purge0000emu", nil)
+	con, conKey := mk("0100purge0000con", map[string]any{"origin": "console"})
+	if _, err := st.RetireEmulatorSaves(ctx); err != nil {
 		t.Fatal(err)
 	}
-	req, _ := http.NewRequest("GET", srv.URL+"/internal/accounts/"+acct+"/saves/switch/0100consoleonly000", nil)
-	req.Header.Set("X-Internal-Key", "internal")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
+	n, b, left, err := svc.PurgeRetired(ctx)
+	if err != nil || left != 0 || n < 1 || b < 4 {
+		t.Fatalf("purge: %d versions, %d bytes, %d left, %v", n, b, left, err)
 	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("console-only title: emulator newest answered %d, want 204", resp.StatusCode)
+	if _, err := st.Version(ctx, emu.ID); err != store.ErrNotFound {
+		t.Fatalf("the retired version row survived: %v", err)
+	}
+	if rc, _, err := local.Get(ctx, emuKey); err == nil {
+		rc.Close()
+		t.Fatal("the retired version's bytes survived")
+	}
+	if v, err := st.Version(ctx, con.ID); err != nil || v.Status != store.Live {
+		t.Fatalf("a console archive was touched: %+v %v", v, err)
+	}
+	if rc, _, err := local.Get(ctx, conKey); err != nil {
+		t.Fatalf("a console archive's bytes were touched: %v", err)
+	} else {
+		rc.Close()
 	}
 }

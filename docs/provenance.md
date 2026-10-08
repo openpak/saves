@@ -264,20 +264,17 @@ and pushes `POST /api/save/<title hex>` with the raw save as the body, bearer = 
 token. That is the whole emulator contract Reference offers: newest wins, no versions, no
 conflict. Evidence for what a client will do, not a design to keep.
 
-## One history per title, two formats
+## Console archives only
 
-Console archives (made through the console upload protocol, marked `origin: console` in the
-version's meta) and emulator saves (the emulator API's single-part zips) live under the same
-save record, platform `switch`, so a title has one history across every device. Two rules keep
-the formats from getting in each other's way:
+The cloud holds console archives and nothing else: backups made through the console upload
+protocol by a real Switch or by Harbor (which acts exactly like a real console), marked
+`origin: console` in the version's meta. The same account sees the same archives on every
+device. Retention keeps the last 10 live, unpinned versions per title.
 
-- retention keeps the last 10 live, unpinned versions of each kind, not of the two together;
-- the emulator API's newest save is the newest emulator-format version, and the console list
-  holds console archives only.
-
-There is no conversion between the formats, and none is planned. Console archives are for
-consoles and for Harbor, which acts exactly like a real console: it uses only console archives,
-through the console protocol, and never converts emulator saves. Emulator saves are for the
-emulator API. The old Ryujinx and other emulator saves are not carried over into console
-archives. The server could not convert them anyway: that needs the user's console keys, which
-it never has.
+The emulator save API (`PUT`/`GET /internal/accounts/{account}/saves/{platform}/{title}`, and
+the website's `/api/v1/me/saves/{platform}/{title}` over it) is retired since v0.4.0: both
+answer 410 Gone, `{"error": "emulator saves are retired; OpenPak's Save Data Cloud is console
+archives only"}`. Saves the old API stored (Citron, Ryujinx, Cemu and the rest) are disregarded:
+at start every live version without the console mark becomes `retired`, which hides it from every
+list, download, restore and console route while keeping it on disk. Nothing converts between
+formats; the server could not (it never has the console keys).

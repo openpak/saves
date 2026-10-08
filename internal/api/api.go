@@ -2,9 +2,8 @@
 // the app) uses. Every route is behind X-Internal-Key; the caller has already decided who
 // the account is. Ports.md: 20020.
 //
-//	GET    /internal/accounts/{account}/saves                                   every save with its live versions
-//	PUT    /internal/accounts/{account}/saves/{platform}/{title}?base=N&device= body = the save; one part
-//	GET    /internal/accounts/{account}/saves/{platform}/{title}                newest live version's bytes (204: none)
+//	GET    /internal/accounts/{account}/saves                                   every save with its live versions (console archives)
+//	PUT|GET /internal/accounts/{account}/saves/{platform}/{title}               410 Gone: the emulator save API is retired
 //	GET    /internal/accounts/{account}/versions/{id}                           one version's bytes
 //	POST   /internal/accounts/{account}/versions/{id}/pin   {"pinned":true}
 //	POST   /internal/accounts/{account}/versions/{id}/restore
@@ -45,8 +44,8 @@ type Server struct {
 func (s *Server) Register(mux *http.ServeMux) {
 	a := func(pattern string, h http.HandlerFunc) { mux.HandleFunc(pattern, s.auth(h)) }
 	a("GET /internal/accounts/{account}/saves", s.listSaves)
-	a("PUT /internal/accounts/{account}/saves/{platform}/{title}", s.putSave)
-	a("GET /internal/accounts/{account}/saves/{platform}/{title}", s.getNewest)
+	a("PUT /internal/accounts/{account}/saves/{platform}/{title}", retired)
+	a("GET /internal/accounts/{account}/saves/{platform}/{title}", retired)
 	a("GET /internal/accounts/{account}/versions/{id}", s.getVersion)
 	a("POST /internal/accounts/{account}/versions/{id}/pin", s.pin)
 	a("POST /internal/accounts/{account}/versions/{id}/restore", s.restore)
@@ -146,100 +145,20 @@ func (s *Server) listSaves(w http.ResponseWriter, r *http.Request) {
 	jsonOut(w, 200, map[string]any{"saves": out, "usage": map[string]any{"allowance_used": used, "allowance": s.Svc.Allowance, "total": total}})
 }
 
-// putSave is the emulator upload: one part, the whole save, streamed.
-func (s *Server) putSave(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	account, platform, title := r.PathValue("account"), r.PathValue("platform"), r.PathValue("title")
-	var base *int
-	if b, err := strconv.Atoi(r.URL.Query().Get("base")); err == nil && b > 0 {
-		base = &b
-	}
-	loc, backend, err := s.Svc.BackendFor(ctx, account)
-	if err != nil {
-		failWith(w, err)
-		return
-	}
-	if err := s.Svc.CheckAllowance(ctx, account, loc.Backend, r.ContentLength); err != nil {
-		failWith(w, err)
-		return
-	}
-	sv, err := s.Svc.Store.EnsureSave(ctx, account, platform, title)
-	if err != nil {
-		failWith(w, err)
-		return
-	}
-	declared := r.ContentLength
-	if declared < 0 {
-		declared = 0 // chunked: nothing to reserve, the write itself is checked below
-	}
-	v, err := s.Svc.Store.NewVersion(ctx, sv.ID, base, r.URL.Query().Get("device"), loc, nil, declared, nil, 0, s.Svc.Quota(loc.Backend))
-	if err != nil {
-		failWith(w, err)
-		return
-	}
-	p, err := s.Svc.Store.AddPart(ctx, v.ID, 0, "save", service.Key(account, platform, title, v.ID, 0))
-	if err != nil {
-		failWith(w, err)
-		return
-	}
-	n, digest, err := s.Svc.PutPart(ctx, backend, p, r.Body, r.ContentLength)
-	if err != nil {
-		_, _ = s.Svc.Store.MarkDeleted(ctx, v.ID)
-		failWith(w, err)
-		return
-	}
-	if loc.Backend == blob.Local {
-		// The content length was the promise; the bytes are the fact.
-		if err := s.Svc.CheckAllowance(ctx, account, loc.Backend, n); err != nil {
-			_ = backend.Delete(ctx, p.Key)
-			_, _ = s.Svc.Store.MarkDeleted(ctx, v.ID)
-			failWith(w, err)
-			return
-		}
-	}
-	if err := s.Svc.Store.SetPartStatus(ctx, p.ID, store.Fixed, &n, digest); err != nil {
-		failWith(w, err)
-		return
-	}
-	live, gone, err := s.Svc.Store.Finish(ctx, v.ID, digest)
-	if err != nil {
-		failWith(w, err)
-		return
-	}
-	for _, g := range gone {
-		s.Svc.DeleteBlobs(ctx, account, g)
-	}
-	s.Svc.Store.Audit(ctx, account, "upload", map[string]any{"platform": platform, "title": title, "version": live.Number, "bytes": n, "conflict": live.Conflict})
-	jsonOut(w, http.StatusCreated, versionJSON(*live))
-}
+// RetiredReason is what the retired emulator routes answer.
+const RetiredReason = "emulator saves are retired; OpenPak's Save Data Cloud is console archives only"
 
-func (s *Server) getNewest(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	account := r.PathValue("account")
-	sv, err := s.Svc.Store.SaveOf(ctx, account, r.PathValue("platform"), r.PathValue("title"))
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		failWith(w, err)
-		return
-	}
-	v, err := s.Svc.Store.Newest(ctx, sv.ID)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		failWith(w, err)
-		return
-	}
-	s.stream(w, r, account, v)
+// retired answers the emulator save routes, which no longer store or serve anything.
+func retired(w http.ResponseWriter, _ *http.Request) {
+	jsonErr(w, http.StatusGone, RetiredReason)
 }
 
 func (s *Server) version(w http.ResponseWriter, r *http.Request) (*store.Version, bool) {
 	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	v, err := s.Svc.Store.Version(r.Context(), id)
+	if err == nil && v.Status == store.Retired {
+		err = store.ErrNotFound // a retired emulator save is not there to anyone
+	}
 	if err != nil {
 		failWith(w, err)
 		return nil, false

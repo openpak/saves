@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -61,6 +62,12 @@ func main() {
 	if n, err := st.ClearRunningMoves(context.Background()); err == nil && n > 0 {
 		log.Printf("saves: %d storage move(s) were running when this process last stopped; marked interrupted", n)
 	}
+	// The emulator save API is retired; what it stored is hidden, not deleted.
+	if n, err := st.RetireEmulatorSaves(context.Background()); err != nil {
+		log.Fatalf("saves: retiring emulator saves: %v", err)
+	} else if n > 0 {
+		log.Printf("saves: retired %d emulator save version(s); hidden, not deleted", n)
+	}
 	credKey := required("SAVES_CREDENTIAL_KEY")
 	if len(credKey) < 32 {
 		log.Fatal("SAVES_CREDENTIAL_KEY must be at least 32 bytes")
@@ -75,6 +82,16 @@ func main() {
 		},
 		UploadHost:   env("SAVES_UPLOAD_HOST", "scsi-upload.lp1.scsi.srv.nintendo.net"),
 		DownloadHost: env("SAVES_DOWNLOAD_HOST", "scsi-download.lp1.scsi.srv.nintendo.net"),
+	}
+
+	// `app purge-retired` deletes what the retired emulator API stored, once the owner said so.
+	if len(os.Args) > 1 && os.Args[1] == "purge-retired" {
+		n, b, left, err := svc.PurgeRetired(context.Background())
+		fmt.Printf("purged %d version(s), %d bytes; %d tombstone(s) left; err=%v\n", n, b, left, err)
+		if err != nil || left > 0 {
+			os.Exit(1)
+		}
+		return
 	}
 
 	mux := http.NewServeMux()

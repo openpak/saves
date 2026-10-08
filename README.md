@@ -6,8 +6,8 @@ the player's own S3-compatible storage for everything beyond it. The plan is
 [`prds/cloud-saves-prd.md`](prds/cloud-saves-prd.md); what is known about the console's
 protocol, and from where, is [`docs/provenance.md`](docs/provenance.md).
 
-**Status (2026-09-10): built and deployed.** Emulator and website surfaces work end to end.
-The Switch surface is served and answers the console's request set; whether a console accepts
+**Status (2026-10-08): built and deployed.** The cloud holds console archives only: the emulator
+save API is retired (410 Gone) since v0.4.0. The Switch surface is served and answers the console's request set; whether a console accepts
 a server-minted key seed package (milestone M0) is not yet known, and the log line
 `[scsi] M0 key_seed_package` is where that answer will appear.
 
@@ -16,17 +16,17 @@ a server-minted key seed package (milestone M0) is not yet known, and the log li
 | Piece | Where |
 | --- | --- |
 | `cmd/saves` | the service: `/internal/*` for the website, `/scsi/*` for the Switch adapter, `/healthz` |
-| `internal/store` | Postgres: saves, versions, parts, storage settings, audit; retention (last 10 of each kind + pinned) |
+| `internal/store` | Postgres: saves, versions, parts, storage settings, audit; retention (last 10 + pinned) |
 | `internal/blob` | backends: `local` (the allowance, a directory) and `s3` (the player's bucket, presigned URLs); sealed credentials |
 | `internal/switchscsi` | the console's archives and component files over the same index |
 | `internal/api` | the internal HTTP API |
 
 Who calls it:
 
-- **website** (`SAVES_URL`, `SAVES_INTERNAL_KEY`): `/account/saves` and the mobile/emulator
-  API `/api/v1/me/saves[/{platform}/{title}]`. An emulator does `GET` on launch (204 means
-  nothing stored; `X-Save-Version` says what it got) and `PUT` on exit with `X-Save-Base` set
-  to that version, so a save from a stale base is kept as a conflict instead of overwriting.
+- **website** (`SAVES_URL`, `SAVES_INTERNAL_KEY`): `/account/saves`, over `/internal/accounts/{account}/...`.
+  The emulator save routes (`PUT`/`GET .../saves/{platform}/{title}`) answer 410 Gone: the
+  cloud is console archives made by a real Switch or Harbor, nothing else. What the old API
+  stored is marked `retired` (hidden, kept) at start; `app purge-retired` deletes it, bytes and rows.
 - **nx-baas** (`SAVES_URL`, `SAVES_INTERNAL_KEY`): forwards every `*.scsi.srv.nintendo.net`
   request here under `/scsi`, with the console's proven account in `X-OpenPak-Account`. The
   console must resolve those names to OpenPak: `console/openpak-nro` redirects

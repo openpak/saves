@@ -82,6 +82,9 @@ const (
 	Uploading = "uploading"
 	Live      = "live"
 	Deleted   = "deleted"
+	// Retired marks a version made through the retired emulator API. It is hidden from every
+	// list and download and kept on disk until the owner says it may go (RetiredVersions).
+	Retired = "retired"
 
 	Pending = "pending"
 	Fixed   = "fixed"
@@ -327,33 +330,6 @@ func (s *Store) Versions(ctx context.Context, saveID int64, all bool) ([]Version
 	return vs, nil
 }
 
-// Newest is the current live emulator-format version of a save, or ErrNotFound: the newest
-// live version that is not a conflict, because a conflict is a divergence waiting for the
-// player and not the progress to hand the next device. If every live version is a conflict,
-// the newest of them is still the best answer there is. Console archives share the save's
-// history but are not what an emulator can load, so they are never the answer.
-func (s *Store) Newest(ctx context.Context, saveID int64) (*Version, error) {
-	all, err := s.Versions(ctx, saveID, false)
-	if err != nil {
-		return nil, err
-	}
-	var vs []Version
-	for _, v := range all {
-		if o, _ := v.Meta["origin"].(string); o != "console" {
-			vs = append(vs, v)
-		}
-	}
-	if len(vs) == 0 {
-		return nil, ErrNotFound
-	}
-	for i := range vs {
-		if !vs[i].Conflict {
-			return &vs[i], nil
-		}
-	}
-	return &vs[0], nil
-}
-
 const versionSelect = `SELECT v.id, v.save_id, v.number, v.base_number, v.status, v.conflict, v.pinned, v.size, v.sha256, v.device, v.backend, v.location, v.meta, v.saved_at, v.created_at, v.finished_at, v.timeout_at FROM versions v`
 
 func scanVersions(rows *sql.Rows) ([]Version, error) {
@@ -446,17 +422,11 @@ func (s *Store) Finish(ctx context.Context, id int64, sha256 string) (*Version, 
 	return v, gone, nil
 }
 
-// prune is retention: everything live, unpinned and beyond the newest Keep of its kind goes.
-// The kinds are console archives (meta origin "console") and emulator saves; they share one
-// history per title but not one allowance of versions, so a run of one never pushes the other
-// out. A conflict is never pruned automatically — it is the one copy of progress nobody has
-// looked at yet.
+// prune is retention: everything live, unpinned and beyond the newest Keep goes. A conflict
+// is never pruned automatically — it is the one copy of progress nobody has looked at yet.
 func prune(ctx context.Context, tx *sql.Tx, saveID int64) ([]int64, error) {
 	rows, err := tx.QueryContext(ctx, `UPDATE versions SET status='deleted' WHERE id IN (
-		SELECT id FROM (
-			SELECT id, row_number() OVER (PARTITION BY coalesce(meta->>'origin','') = 'console' ORDER BY number DESC) AS rn
-			FROM versions WHERE save_id=$1 AND status='live' AND NOT pinned AND NOT conflict) k
-		WHERE rn > $2) RETURNING id`, saveID, Keep)
+		SELECT id FROM versions WHERE save_id=$1 AND status='live' AND NOT pinned AND NOT conflict ORDER BY number DESC OFFSET $2) RETURNING id`, saveID, Keep)
 	if err != nil {
 		return nil, err
 	}
@@ -733,4 +703,46 @@ func (s *Store) ClearRunningMoves(ctx context.Context) (int64, error) {
 func (s *Store) Audit(ctx context.Context, account, action string, detail map[string]any) {
 	dj, _ := json.Marshal(detail)
 	_, _ = s.db.ExecContext(ctx, `INSERT INTO audit (account_id, action, detail) VALUES ($1,$2,$3)`, account, action, dj)
+}
+
+// RetireEmulatorSaves marks every live version that did not come through the console protocol
+// (meta origin "console") as retired, and reports how many that changed. Nothing is deleted:
+// retired rows and their blobs stay until someone removes them in one step, e.g.
+//
+//	DELETE FROM versions WHERE status='retired'   -- then let the blobs follow (Retired lists them)
+//
+// It is idempotent and safe to run on every start.
+func (s *Store) RetireEmulatorSaves(ctx context.Context) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE versions SET status='retired', pinned=false
+		WHERE status='live' AND coalesce(meta->>'origin','')<>'console'`)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// Retired is how many retired versions there are and the bytes they hold.
+func (s *Store) Retired(ctx context.Context) (n int64, bytes int64, err error) {
+	err = s.db.QueryRowContext(ctx, `SELECT count(*), coalesce(sum(size),0) FROM versions WHERE status='retired'`).Scan(&n, &bytes)
+	return
+}
+
+// DeleteRetired turns every retired version into a tombstone (status deleted) for the sweep or
+// PurgeRetired to remove, bytes and rows, and returns how many that was. It is the one step
+// the owner's go-ahead unlocks.
+func (s *Store) DeleteRetired(ctx context.Context) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE versions SET status='deleted', pinned=false WHERE status='retired'`)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// DropEmptySaves removes save records that no longer hold any version.
+func (s *Store) DropEmptySaves(ctx context.Context) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM saves s WHERE NOT EXISTS (SELECT 1 FROM versions v WHERE v.save_id=s.id)`)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
