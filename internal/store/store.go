@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS parts (
 	digest     text NOT NULL DEFAULT '',
 	key        text NOT NULL
 );
+ALTER TABLE parts ADD COLUMN IF NOT EXISTS shared boolean NOT NULL DEFAULT false;
 CREATE INDEX IF NOT EXISTS parts_version ON parts(version_id);
 CREATE TABLE IF NOT EXISTS storage_settings (
 	account_id   text PRIMARY KEY,
@@ -145,6 +146,10 @@ type Part struct {
 	Size      *int64
 	Digest    string
 	Key       string
+	// Shared marks a pending part of a delta upload that still points at the previous
+	// archive's bytes (its blob key): the console has not re-uploaded that chunk, so at finish
+	// the part is the previous one, unchanged. Writing to it first gives it a key of its own.
+	Shared bool
 }
 
 type Settings struct {
@@ -277,11 +282,33 @@ func (s *Store) AddPart(ctx context.Context, versionID int64, idx int, kind, key
 	return p, err
 }
 
+// AddSharedPart adds a pending part that points at an existing blob (a delta upload's
+// unchanged chunk): same key, size and digest as the previous archive's part. The blob stays
+// in use for as long as this version does (KeyInUse), so the previous archive can be pruned or
+// deleted while the delta is still uploading.
+func (s *Store) AddSharedPart(ctx context.Context, versionID int64, idx int, kind, key string, size *int64, digest string) (*Part, error) {
+	p := &Part{VersionID: versionID, Index: idx, Kind: kind, Status: Pending, Key: key, Size: size, Digest: digest, Shared: true}
+	err := s.db.QueryRowContext(ctx, `INSERT INTO parts (version_id, idx, kind, status, key, size, digest, shared) VALUES ($1,$2,$3,'pending',$4,$5,$6,true) RETURNING id`,
+		versionID, idx, kind, key, size, digest).Scan(&p.ID)
+	return p, err
+}
+
+// RekeyPart gives a shared part a blob key of its own before anything is written to it, and
+// forgets the size and digest it had borrowed.
+func (s *Store) RekeyPart(ctx context.Context, p *Part, key string) error {
+	p.Key = fmt.Sprintf("%s/%d", key, p.ID)
+	if _, err := s.db.ExecContext(ctx, `UPDATE parts SET key=$2, shared=false, size=NULL, digest='' WHERE id=$1`, p.ID, p.Key); err != nil {
+		return err
+	}
+	p.Shared, p.Size, p.Digest = false, nil, ""
+	return nil
+}
+
 func (s *Store) Part(ctx context.Context, id int64) (*Part, error) {
 	p := &Part{}
 	var size sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT id, version_id, idx, kind, status, size, digest, key FROM parts WHERE id=$1`, id).
-		Scan(&p.ID, &p.VersionID, &p.Index, &p.Kind, &p.Status, &size, &p.Digest, &p.Key)
+	err := s.db.QueryRowContext(ctx, `SELECT id, version_id, idx, kind, status, size, digest, key, shared FROM parts WHERE id=$1`, id).
+		Scan(&p.ID, &p.VersionID, &p.Index, &p.Kind, &p.Status, &size, &p.Digest, &p.Key, &p.Shared)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -353,7 +380,7 @@ func scanVersions(rows *sql.Rows) ([]Version, error) {
 }
 
 func (s *Store) withParts(ctx context.Context, v *Version) (*Version, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, version_id, idx, kind, status, size, digest, key FROM parts WHERE version_id=$1 ORDER BY idx`, v.ID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, version_id, idx, kind, status, size, digest, key, shared FROM parts WHERE version_id=$1 ORDER BY idx`, v.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -362,7 +389,7 @@ func (s *Store) withParts(ctx context.Context, v *Version) (*Version, error) {
 	for rows.Next() {
 		var p Part
 		var size sql.NullInt64
-		if err := rows.Scan(&p.ID, &p.VersionID, &p.Index, &p.Kind, &p.Status, &size, &p.Digest, &p.Key); err != nil {
+		if err := rows.Scan(&p.ID, &p.VersionID, &p.Index, &p.Kind, &p.Status, &size, &p.Digest, &p.Key, &p.Shared); err != nil {
 			return nil, err
 		}
 		if size.Valid {
@@ -382,6 +409,10 @@ func (s *Store) Finish(ctx context.Context, id int64, sha256 string) (*Version, 
 	}
 	defer tx.Rollback()
 	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext(s.account_id)::bigint) FROM versions v JOIN saves s ON s.id=v.save_id WHERE v.id=$1`, id); err != nil {
+		return nil, nil, err
+	}
+	// A delta's chunks the console never touched are the previous archive's, unchanged.
+	if _, err := tx.ExecContext(ctx, `UPDATE parts SET status='fixed' WHERE version_id=$1 AND status='pending' AND shared AND size IS NOT NULL`, id); err != nil {
 		return nil, nil, err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM parts WHERE version_id=$1 AND status<>'fixed'`, id); err != nil {

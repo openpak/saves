@@ -308,3 +308,17 @@ Both keys are files on the box, named by `SAVES_KSP_SIGNING_KEY_FILE` (PEM RSA-2
 PKCS#8 or PKCS#1) and `SAVES_KSP_PACKAGE_KEY_FILE` (the 16-byte package key, as 16 raw bytes or
 32 hex characters). Neither is ever in the repo, the image or a log. With either unset or
 unreadable the endpoint answers 503 and the log says the keys are not configured.
+
+## Delta uploads
+
+A delta (`POST save_data_archives/<P>/start_upload` against a fixed archive P) mirrors P's
+components as `hand_over` parts that still point at P's blobs (same key, size, digest). The
+console then touches only the chunks that changed and the meta: `component_files/<id>/update`
+gives the part a blob key of its own (so P's bytes are never overwritten) and an upload URL, the
+console PUTs and finishes it. A chunk it never touches has no upload URL while the archive
+uploads. `finish_upload {"encoded_mac"}` turns every still-shared part into a fixed part of the
+new archive, so the delta is a complete archive of its own: the console list, `start_download`
+and the website's export return every chunk. Retention is safe without materialising anything:
+a blob is deleted only when no live or uploading version still points at its key, so P can be
+pruned or deleted while a delta needs its unchanged chunks, and the last version to hold a key
+removes the blob. The division count of a delta is P's (else the console fails 2179-0301).

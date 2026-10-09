@@ -3,6 +3,12 @@
 Generated from git history on 2026-09-15. `git log` stays the source
 of truth; this file is the readable summary.
 
+## v0.4.3 — 2026-10-09
+
+- a delta upload keeps the previous archive's untouched chunks: they are shared (not copied) until `finish_upload` makes them part of the new archive, so the delta lists, downloads and exports whole
+- a chunk the console replaces (`component_files/<id>/update`) gets its own blob key first; the previous archive's bytes are never overwritten
+- retention and deletes remove a blob only when no live or uploading archive still points at it
+
 ## v0.4.2 — 2026-10-08
 
 - `start_upload` answers a real `num_of_partitions` (one per 8 MiB of `data_size`, 1..64; a delta repeats its previous archive's)

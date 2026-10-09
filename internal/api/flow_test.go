@@ -16,10 +16,12 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -858,5 +860,225 @@ func TestPurgeRetired(t *testing.T) {
 		t.Fatalf("a console archive's bytes were touched: %v", err)
 	} else {
 		rc.Close()
+	}
+}
+
+// A delta upload (start_upload against a fixed archive, then only the changed chunks and the
+// meta) is a complete archive of its own: the chunks the console never touched are the
+// previous archive's, unchanged, for download, for the console list, and after the previous
+// archive has been pruned.
+func TestDeltaUploadKeepsUnchangedChunks(t *testing.T) {
+	dbURL := requireDB(t)
+	st, err := store.Open(dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	dataDir := t.TempDir()
+	local, _ := blob.NewLocal(dataDir)
+	svc := &service.Service{Store: st, Local: local, Allowance: 100 << 20, CredentialKey: []byte("k"), URLKey: []byte("u"),
+		UploadHost: "up.test", DownloadHost: "down.test"}
+	mux := http.NewServeMux()
+	(&api.Server{Svc: svc, Key: "internal"}).Register(mux)
+	(&switchscsi.Server{Svc: svc}).Register(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	acct := fmt.Sprintf("acct-delta-%d", os.Getpid())
+	title := "0100dddd0000eeee"
+	sw := map[string]string{"X-OpenPak-Account": acct, "X-OpenPak-NSA": "00000000000000aa", "X-OpenPak-Device": "0000000000000001"}
+	do := func(method, path, body string, hdr map[string]string) (int, []byte) {
+		req, _ := http.NewRequest(method, srv.URL+path, strings.NewReader(body))
+		req.Header.Set("X-Internal-Key", "internal")
+		for k, v := range hdr {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, b
+	}
+	const v3 = "/scsi/api/console/v3/"
+	digest := "AQIDBAUGBwgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	type comp struct {
+		ID     int64  `json:"id"`
+		Index  int    `json:"index"`
+		Status string `json:"status"`
+		GetURL string `json:"get_url"`
+		PutURL string `json:"put_url"`
+	}
+	type archiveOut struct {
+		ID         int64  `json:"id"`
+		Status     string `json:"status"`
+		Partitions int    `json:"num_of_partitions"`
+		Comps      []comp `json:"component_files"`
+	}
+	parse := func(code int, b []byte, want int) archiveOut {
+		t.Helper()
+		var r struct {
+			A archiveOut `json:"save_data_archive"`
+		}
+		if err := json.Unmarshal(b, &r); code != want || err != nil {
+			t.Fatalf("archive reply: %d %s", code, b)
+		}
+		return r.A
+	}
+	put := func(putURL, body string) {
+		t.Helper()
+		pu, _ := url.Parse(putURL)
+		if code, _ := do("PUT", "/scsi"+pu.Path+"?"+pu.RawQuery, body, nil); code != 200 {
+			t.Fatalf("blob put: %d", code)
+		}
+	}
+	finishComp := func(id int64, body string) {
+		t.Helper()
+		if code, b := do("POST", fmt.Sprintf("%scomponent_files/%d/finish_upload", v3, id), fmt.Sprintf(`{"archive_size":%d,"encoded_archive_digest":"x"}`, len(body)), sw); code != 200 {
+			t.Fatalf("component finish: %d %s", code, b)
+		}
+	}
+	// A full upload of chunks 0 (meta), 4096 and 8192.
+	startBody := `{"application_id":"` + title + `","datatype":0,"data_size":24,"saved_at_as_unixtime":1783207776,"launch_required_version":0,"series_id":42,"encoded_digest":"` + digest + `","acd_index":0}`
+	code, b := do("POST", v3+"save_data_archives/start_upload", startBody, sw)
+	full := parse(code, b, 201)
+	first := full.ID
+	for _, c := range []struct {
+		idx  int
+		kind string
+		body string
+	}{{0, "meta", "meta-1"}, {4096, "save", "chunk-4096-v1"}, {8192, "save", "chunk-8192-v1"}} {
+		code, b := do("POST", fmt.Sprintf("%ssave_data_archives/%d/component_files/create", v3, first), fmt.Sprintf(`{"index":%d,"datatype":"%s"}`, c.idx, c.kind), sw)
+		var cf struct {
+			C comp `json:"component_file"`
+		}
+		if _ = json.Unmarshal(b, &cf); code != 201 {
+			t.Fatalf("create %d: %d %s", c.idx, code, b)
+		}
+		put(cf.C.PutURL, c.body)
+		finishComp(cf.C.ID, c.body)
+	}
+	seedB64 := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{7}, 16))
+	if code, b := do("POST", fmt.Sprintf("%ssave_data_archives/%d/finish_upload", v3, first), `{"encoded_key_seed":"`+seedB64+`","encoded_mac":"`+seedB64+`"}`, sw); code != 200 {
+		t.Fatalf("finish full: %d %s", code, b)
+	}
+
+	// chunks reads an archive back through the console protocol: index -> bytes.
+	chunks := func(id int64) map[int]string {
+		t.Helper()
+		code, b := do("POST", fmt.Sprintf("%ssave_data_archives/%d/start_download", v3, id), "", sw)
+		a := parse(code, b, 200)
+		got := map[int]string{}
+		for _, c := range a.Comps {
+			gu, _ := url.Parse(c.GetURL)
+			code, body := do("GET", "/scsi"+gu.Path+"?"+gu.RawQuery, "", nil)
+			if code != 200 {
+				t.Fatalf("download chunk %d of archive %d: %d", c.Index, id, code)
+			}
+			got[c.Index] = string(body)
+		}
+		return got
+	}
+	// delta changes the chunk at 4096 and the meta, leaves 8192 alone.
+	delta := func(prev int64, meta, c4096 string) int64 {
+		t.Helper()
+		code, b := do("POST", fmt.Sprintf("%ssave_data_archives/%d/start_upload", v3, prev), startBody, sw)
+		a := parse(code, b, 201)
+		if a.Partitions != 1 || len(a.Comps) != 3 {
+			t.Fatalf("a delta mirrors the previous archive's three chunks, got %d (partitions %d)", len(a.Comps), a.Partitions)
+		}
+		byIdx := map[int]comp{}
+		for _, c := range a.Comps {
+			if c.Status != "hand_over" {
+				t.Fatalf("chunk %d of a delta starts hand_over, got %q", c.Index, c.Status)
+			}
+			byIdx[c.Index] = c
+		}
+		for idx, body := range map[int]string{0: meta, 4096: c4096} {
+			code, b := do("POST", fmt.Sprintf("%scomponent_files/%d/update", v3, byIdx[idx].ID), "", sw)
+			var cf struct {
+				C comp `json:"component_file"`
+			}
+			if _ = json.Unmarshal(b, &cf); code != 200 || cf.C.PutURL == "" {
+				t.Fatalf("update %d: %d %s", idx, code, b)
+			}
+			put(cf.C.PutURL, body)
+			finishComp(cf.C.ID, body)
+		}
+		// While uploading, the archive lists its unchanged chunk without an upload URL.
+		code, b = do("GET", fmt.Sprintf("%ssave_data_archives/%d", v3, a.ID), "", sw)
+		for _, c := range parse(code, b, 200).Comps {
+			if c.Index == 8192 && (c.PutURL != "" || c.Status != "hand_over") {
+				t.Fatalf("the untouched chunk must stay hand_over with no upload URL: %+v", c)
+			}
+		}
+		code, b = do("POST", fmt.Sprintf("%ssave_data_archives/%d/finish_upload", v3, a.ID), `{"encoded_mac":"`+seedB64+`"}`, sw)
+		fin := parse(code, b, 200)
+		if fin.Status != "fixed" || len(fin.Comps) != 3 {
+			t.Fatalf("a finished delta holds every chunk: %+v", fin)
+		}
+		return a.ID
+	}
+
+	second := delta(first, "meta-2", "chunk-4096-v2")
+	if got := chunks(second); len(got) != 3 || got[0] != "meta-2" || got[4096] != "chunk-4096-v2" || got[8192] != "chunk-8192-v1" {
+		t.Fatalf("delta download: %v", got)
+	}
+	if got := chunks(first); got[0] != "meta-1" || got[4096] != "chunk-4096-v1" || got[8192] != "chunk-8192-v1" {
+		t.Fatalf("the full archive changed under its delta: %v", got)
+	}
+	// The console list carries both, each with its division count.
+	code, b = do("GET", v3+"save_data_archives?datatype=0&application_id="+title, "", sw)
+	var listed struct {
+		A []struct {
+			ID         int64 `json:"id"`
+			Partitions int   `json:"num_of_partitions"`
+		} `json:"save_data_archives"`
+	}
+	if _ = json.Unmarshal(b, &listed); code != 200 || len(listed.A) != 2 || listed.A[0].Partitions != 1 || listed.A[1].Partitions != 1 {
+		t.Fatalf("console list: %d %s", code, b)
+	}
+	// The website's export of the delta holds all three chunks too.
+	code, b = do("GET", fmt.Sprintf("/internal/accounts/%s/versions/%d", acct, second), "", nil)
+	zr, zerr := zip.NewReader(bytes.NewReader(b), int64(len(b)))
+	if code != 200 || zerr != nil || len(zr.File) != 3 {
+		t.Fatalf("export of a delta: %d %v", code, zerr)
+	}
+
+	// Retention: a chain of deltas pushes the full archive out of the last Keep. Its bytes for
+	// the chunk nobody ever changed must survive it, and the newest archive stays whole.
+	last := second
+	for i := 3; i <= store.Keep+3; i++ {
+		last = delta(last, fmt.Sprintf("meta-%d", i), fmt.Sprintf("chunk-4096-v%d", i))
+	}
+	if code, _ := do("GET", fmt.Sprintf("%ssave_data_archives/%d", v3, first), "", sw); code != 404 {
+		t.Fatalf("the full archive should have been pruned by retention, got %d", code)
+	}
+	want := store.Keep + 3
+	if got := chunks(last); len(got) != 3 || got[0] != fmt.Sprintf("meta-%d", want) || got[4096] != fmt.Sprintf("chunk-4096-v%d", want) || got[8192] != "chunk-8192-v1" {
+		t.Fatalf("newest delta after the full archive was pruned: %v", got)
+	}
+	// And the oldest still-live delta, too.
+	code, b = do("GET", v3+"save_data_archives?datatype=0&application_id="+title, "", sw)
+	_ = json.Unmarshal(b, &listed)
+	if code != 200 || len(listed.A) != store.Keep {
+		t.Fatalf("after retention the list holds %d archives (%d)", len(listed.A), code)
+	}
+	if got := chunks(listed.A[len(listed.A)-1].ID); got[8192] != "chunk-8192-v1" || len(got) != 3 {
+		t.Fatalf("the oldest live delta lost a chunk: %v", got)
+	}
+	// Deleting every archive of the title finally removes the shared blob.
+	if code, _ := do("DELETE", "/internal/accounts/"+acct+"/saves/switch/"+title, "", nil); code != 200 {
+		t.Fatalf("delete title: %d", code)
+	}
+	files := 0
+	_ = filepath.WalkDir(dataDir, func(_ string, d fs.DirEntry, _ error) error {
+		if d != nil && !d.IsDir() {
+			files++
+		}
+		return nil
+	})
+	if files != 0 {
+		t.Fatalf("%d blob(s) left after every archive was deleted", files)
 	}
 }

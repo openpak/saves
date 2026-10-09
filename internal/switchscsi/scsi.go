@@ -613,18 +613,25 @@ func (s *Server) startUpload(ctx context.Context, w http.ResponseWriter, r *http
 		nintendoErr(w, http.StatusInternalServerError, "internal_server_error", "Internal error", err.Error())
 		return
 	}
-	// Components: mirror the previous archive's set, or start with meta alone.
-	shape := []store.Part{{Index: metaIndex, Kind: "meta"}}
+	// Components. A full upload starts with a lone meta; a delta mirrors the previous archive's
+	// fixed set as hand_over parts that still point at its blobs (finish keeps whatever the
+	// console does not re-upload).
+	var mirror []store.Part
 	if prev != nil {
 		for _, p := range prev.Parts {
 			if p.Status == store.Fixed {
-				shape = append(shape[:0], prev.Parts...)
-				break
+				mirror = append(mirror, p)
 			}
 		}
 	}
-	for _, p := range shape {
-		if _, err := s.Svc.Store.AddPart(ctx, v.ID, p.Index, p.Kind, service.Key(c.account, Platform, title, v.ID, p.Index)); err != nil {
+	if len(mirror) == 0 {
+		if _, err := s.Svc.Store.AddPart(ctx, v.ID, metaIndex, "meta", service.Key(c.account, Platform, title, v.ID, metaIndex)); err != nil {
+			nintendoErr(w, http.StatusInternalServerError, "internal_server_error", "Internal error", err.Error())
+			return
+		}
+	}
+	for _, p := range mirror {
+		if _, err := s.Svc.Store.AddSharedPart(ctx, v.ID, p.Index, p.Kind, p.Key, p.Size, p.Digest); err != nil {
 			nintendoErr(w, http.StatusInternalServerError, "internal_server_error", "Internal error", err.Error())
 			return
 		}
@@ -671,6 +678,10 @@ func (s *Server) createComponent(ctx context.Context, w http.ResponseWriter, r *
 			return
 		}
 	}
+	if err := s.writable(ctx, c, v, sv, p); err != nil {
+		nintendoErr(w, http.StatusInternalServerError, "internal_server_error", "Internal error", err.Error())
+		return
+	}
 	cf := componentOf(*p)
 	cf.PutURL = s.putURL(ctx, c, v, p)
 	out(w, http.StatusCreated, map[string]any{"component_file": cf})
@@ -690,7 +701,7 @@ func (s *Server) components(ctx context.Context, w http.ResponseWriter, r *http.
 	if !mustPost(w, r) {
 		return
 	}
-	v, _, ok := s.owned(ctx, w, c, p.VersionID)
+	v, sv, ok := s.owned(ctx, w, c, p.VersionID)
 	if !ok {
 		return
 	}
@@ -709,6 +720,11 @@ func (s *Server) components(ctx context.Context, w http.ResponseWriter, r *http.
 		cf.GetURL = s.getURL(ctx, b, v, p.ID)
 		out(w, 200, map[string]any{"component_file": cf})
 	case "update":
+		// The console replaces a chunk the previous archive had: from here the part is its own.
+		if err := s.writable(ctx, c, v, sv, p); err != nil {
+			nintendoErr(w, http.StatusInternalServerError, "internal_server_error", "Internal error", err.Error())
+			return
+		}
 		_ = s.Svc.Store.SetPartStatus(ctx, p.ID, "uploading", nil, "")
 		p.Status = "uploading"
 		cf := componentOf(*p)
@@ -740,6 +756,16 @@ func (s *Server) components(ctx context.Context, w http.ResponseWriter, r *http.
 	default:
 		nintendoErr(w, http.StatusNotFound, "resource_is_not_found", "Specified resource is not found", "Resource is not found")
 	}
+}
+
+// writable makes a part safe to write to. A delta's unchanged chunk shares the previous
+// archive's blob key; writing through it would overwrite that archive's bytes, so the part
+// gets a key of its own first.
+func (s *Server) writable(ctx context.Context, c caller, v *store.Version, sv *store.Save, p *store.Part) error {
+	if !p.Shared {
+		return nil
+	}
+	return s.Svc.Store.RekeyPart(ctx, p, service.Key(c.account, Platform, sv.TitleID, v.ID, p.Index))
 }
 
 // putURL and getURL are where the bytes go and come from: the player's own bucket when it
@@ -777,7 +803,8 @@ func (s *Server) attachPutURLs(ctx context.Context, a *archive, v *store.Version
 			continue
 		}
 		for i := range v.Parts {
-			if v.Parts[i].ID == cf.ID {
+			// A shared (hand_over) part has no upload URL: the console asks for one with update.
+			if v.Parts[i].ID == cf.ID && !v.Parts[i].Shared {
 				cf.PutURL = s.putURL(ctx, c, v, &v.Parts[i])
 			}
 		}
