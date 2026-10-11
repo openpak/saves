@@ -1027,7 +1027,7 @@ func TestDeltaUploadKeepsUnchangedChunks(t *testing.T) {
 	if got := chunks(first); got[0] != "meta-1" || got[4096] != "chunk-4096-v1" || got[8192] != "chunk-8192-v1" {
 		t.Fatalf("the full archive changed under its delta: %v", got)
 	}
-	// The console list carries both, each with its division count.
+	// The console list carries only the current backup, with its division count.
 	code, b = do("GET", v3+"save_data_archives?datatype=0&application_id="+title, "", sw)
 	var listed struct {
 		A []struct {
@@ -1035,7 +1035,7 @@ func TestDeltaUploadKeepsUnchangedChunks(t *testing.T) {
 			Partitions int   `json:"num_of_partitions"`
 		} `json:"save_data_archives"`
 	}
-	if _ = json.Unmarshal(b, &listed); code != 200 || len(listed.A) != 2 || listed.A[0].Partitions != 1 || listed.A[1].Partitions != 1 {
+	if _ = json.Unmarshal(b, &listed); code != 200 || len(listed.A) != 1 || listed.A[0].ID != second || listed.A[0].Partitions != 1 {
 		t.Fatalf("console list: %d %s", code, b)
 	}
 	// The website's export of the delta holds all three chunks too.
@@ -1058,13 +1058,22 @@ func TestDeltaUploadKeepsUnchangedChunks(t *testing.T) {
 	if got := chunks(last); len(got) != 3 || got[0] != fmt.Sprintf("meta-%d", want) || got[4096] != fmt.Sprintf("chunk-4096-v%d", want) || got[8192] != "chunk-8192-v1" {
 		t.Fatalf("newest delta after the full archive was pruned: %v", got)
 	}
-	// And the oldest still-live delta, too.
+	// The console still gets just the current backup after many revisions.
 	code, b = do("GET", v3+"save_data_archives?datatype=0&application_id="+title, "", sw)
 	_ = json.Unmarshal(b, &listed)
-	if code != 200 || len(listed.A) != store.Keep {
+	if code != 200 || len(listed.A) != 1 || listed.A[0].ID != last {
 		t.Fatalf("after retention the list holds %d archives (%d)", len(listed.A), code)
 	}
-	if got := chunks(listed.A[len(listed.A)-1].ID); got[8192] != "chunk-8192-v1" || len(got) != 3 {
+	// The website keeps the full live history; its oldest delta is still downloadable by id.
+	code, b = do("GET", "/internal/accounts/"+acct+"/saves", "", nil)
+	var history struct {
+		Saves []api.SaveJSON `json:"saves"`
+	}
+	if err := json.Unmarshal(b, &history); code != 200 || err != nil || len(history.Saves) != 1 || len(history.Saves[0].Versions) != store.Keep {
+		t.Fatalf("website history after retention: %d %s", code, b)
+	}
+	oldest := history.Saves[0].Versions[len(history.Saves[0].Versions)-1].ID
+	if got := chunks(oldest); got[8192] != "chunk-8192-v1" || len(got) != 3 {
 		t.Fatalf("the oldest live delta lost a chunk: %v", got)
 	}
 	// Deleting every archive of the title finally removes the shared blob.

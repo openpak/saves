@@ -18,6 +18,21 @@ Sources:
   brackets are string-table offsets in that dump. This is first-party evidence and outranks
   everything else here: where F and N disagree, F is the console and N is somebody's server.
 
+## Current backup versus history (23.0.1, 2026-10-11)
+
+Our own firmware inspection shows that the native download lookup (`olsc` 0x1e67c0) calls
+the archive-list helper (0x1e61e0) with capacity two. Upload paths (0x210ae0, 0x212ed0) use
+the same bound. The list sink (0x1e7630 / 0x1e76e0) returns 0x1900b3 (module 179,
+description 3200) on a third record. Scratch notes are in
+`scratch/harbor-eden/research/olsc-re/olsc-transfer-work/<user-a>-cloud-download-20261011/`.
+Live Switch retries for titles with three retained revisions stopped after an HTTP 200 list,
+without requesting an archive, key-seed package or blob.
+
+Since v0.4.4, the console list returns only the newest complete live archive per title and
+datatype. This is OpenPak's current-backup policy, based on the client bound; it does not
+establish Nintendo's retention policy. The website still lists every retained revision,
+and archive-id routes still serve them. No backup is deleted to meet the client bound.
+
 ## Hostnames
 
 | Host | Role | Source |

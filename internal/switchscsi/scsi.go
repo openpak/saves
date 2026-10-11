@@ -524,6 +524,11 @@ func (s *Server) list(ctx context.Context, w http.ResponseWriter, r *http.Reques
 			nintendoErr(w, http.StatusInternalServerError, "internal_server_error", "Internal error", err.Error())
 			return
 		}
+		// This is the current cloud backup, not revision history. The native upload and
+		// download paths have room for only two records per title (23.0.1 olsc; provenance).
+		// Versions is newest first; keep the newest complete archive of each datatype.
+		// History remains available through the internal API and archive-id routes.
+		seen := map[int]bool{}
 		for i := range vs {
 			a := s.archiveOf(&vs[i], sv, c, false)
 			if dt := q.Get("datatype"); dt != "" && dt != strconv.Itoa(a.Datatype) {
@@ -535,7 +540,11 @@ func (s *Server) list(ctx context.Context, w http.ResponseWriter, r *http.Reques
 				log.Printf("[scsi] list: archive=%d left out, incomplete for the console", a.ID)
 				continue
 			}
+			if seen[a.Datatype] {
+				continue
+			}
 			list = append(list, listed{archive: a})
+			seen[a.Datatype] = true
 		}
 	}
 	out(w, 200, map[string]any{"save_data_archives": list})

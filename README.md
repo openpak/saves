@@ -11,6 +11,10 @@ save API is retired (410 Gone) since v0.4.0. The Switch surface is served and an
 `SAVES_KSP_SIGNING_KEY_FILE` and `SAVES_KSP_PACKAGE_KEY_FILE` name key files (see
 `docs/provenance.md`); without them it answers 503.
 
+Since v0.4.4, the console list exposes the newest complete backup per title and datatype,
+rather than every retained revision. The native Switch upload/download path rejects a
+third per-title record. Website history and archive-id downloads keep all retained revisions.
+
 ## What runs
 
 | Piece | Where |
