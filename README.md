@@ -44,7 +44,8 @@ complete island archive (`datatype=3`) per title, including an archive uploaded 
 device. Recovery joins those grants with the archive list, then downloads metadata and
 chunks through the existing archive and signed component routes. Ownership is checked
 again on every archive and component request. `device_id=me` scopes a device's backup cache;
-recovery omits that filter. These recovery changes are local and not yet deployed.
+recovery omits that filter. These recovery changes ship with the compressed-byte quota fix
+in the single `ghcr.io/openpak/saves:0.4.5` release image (also tagged `latest`).
 
 The account owner sees and deletes console backups on the website (`/account/saves`) and, later,
 in the app. The website decides who the account is and calls these internal routes

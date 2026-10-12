@@ -51,7 +51,7 @@ list: native OLSC bounds the permission list before joining it, so advertising r
 history could overflow the caller's transfer-memory capacity. Account ownership is checked
 independently on all archive and component routes. `device_id=me` selects the caller's
 device for the local backup cache; the recovery list intentionally omits this restriction.
-These server changes are local, not deployed. Database tests prove the HTTP policy and
+These server changes ship in v0.4.5. Database tests prove the HTTP policy and
 cross-account rejection; Harbor's synthetic transfer checks prove listing, stream recovery,
 version refusal, and cancellation before import. An actual ACNH restore on a real Switch
 or Android device has not been verified by these tests.
@@ -131,7 +131,7 @@ with the segment fixed. Same resources either way, which is why the adapter take
 | `save_data_archives/%llu/delete?force=true` | **yes, since 2026-09-16** | 1468615 |
 | `component_files/%llu/signed_uri`, `/update`, `/finish_upload` | yes | 1469557, 1479976, 1462612 |
 | `application_policy/%016llx/%05u?dtoken=` | yes | 1470372 |
-| `permissions` | yes (local, 2026-10-12) | 1470346 |
+| `permissions` | yes (v0.4.5, 2026-10-12) | 1470346 |
 | `save_data_sets`, `?update=true`, `?survey_request_id=%llu&repair_status=%s` | **no** | 1474085, 1460691, 1464913 |
 | `save_data_sets/generate_key_package` | **no** | 1456214 |
 | `customer_operations`, `?survey_request_id=%llu`, `/update_action_completed` | **no** | 1472350, 1469294, 1471465 |
