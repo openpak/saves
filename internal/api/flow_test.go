@@ -329,18 +329,14 @@ func TestFlow(t *testing.T) {
 		t.Fatalf("the v2 prefix must reach the same archive, got %d", resp.StatusCode)
 	}
 
-	// The allowance is reserved by the uploading archive, not only by what is already stored:
-	// a console that declares half of what is left cannot declare it twice.
-	room := `{"application_id":"0100152000033000","datatype":0,"data_size":55}`
-	if resp := do("POST", "/scsi/api/console/v3/save_data_archives/start_upload", strings.NewReader(room), sw); resp.StatusCode != 201 {
-		t.Fatalf("an upload that fits must be allowed: %d", resp.StatusCode)
-	} else {
+	// Expanded save-image sizes do not reserve compressed storage before any bytes arrive.
+	room := `{"application_id":"0100152000033000","datatype":0,"data_size":1000000}`
+	for i := 0; i < 2; i++ {
+		resp := do("POST", "/scsi/api/console/v3/save_data_archives/start_upload", strings.NewReader(room), sw)
 		resp.Body.Close()
-	}
-	if resp := do("POST", "/scsi/api/console/v3/save_data_archives/start_upload", strings.NewReader(room), sw); resp.StatusCode != 403 {
-		t.Fatalf("the in-flight upload must hold its bytes, got %d", resp.StatusCode)
-	} else {
-		resp.Body.Close()
+		if resp.StatusCode != 201 {
+			t.Fatalf("an expanded image must not spend compressed storage: %d", resp.StatusCode)
+		}
 	}
 
 	// Two devices from the same base: neither is stale when it starts, the second one is by

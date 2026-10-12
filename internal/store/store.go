@@ -93,6 +93,14 @@ const (
 
 var ErrNotFound = errors.New("not found")
 
+var ErrNotUploading = errors.New("archive is not uploading")
+
+// Console data_size describes an expanded save image, not its compressed blobs.
+// New console uploads charge their component bytes; older uploads keep their reservation.
+const chargedBytes = `CASE WHEN v.status='uploading' AND v.meta->>'quota_by_parts'='true'
+ THEN (SELECT coalesce(sum(p.size),0) FROM parts p WHERE p.version_id=v.id)
+ ELSE v.size END`
+
 // Location is where a version's bytes were written: the kind of backend, and the identity of
 // that destination (blob.Config.LocationID). Both are recorded on the version, because the
 // account's settings are a moving target and a stored backup is not.
@@ -240,7 +248,7 @@ func (s *Store) NewVersion(ctx context.Context, saveID int64, base *int, device 
 	}
 	if quota > 0 {
 		var used int64
-		if err := tx.QueryRowContext(ctx, `SELECT coalesce(sum(v.size),0) FROM versions v JOIN saves s ON s.id=v.save_id
+		if err := tx.QueryRowContext(ctx, `SELECT coalesce(sum(`+chargedBytes+`),0) FROM versions v JOIN saves s ON s.id=v.save_id
 			WHERE s.account_id=(SELECT account_id FROM saves WHERE id=$1) AND v.backend=$2 AND v.status IN ('live','uploading')`, saveID, loc.Backend).Scan(&used); err != nil {
 			return nil, err
 		}
@@ -321,6 +329,64 @@ func (s *Store) Part(ctx context.Context, id int64) (*Part, error) {
 func (s *Store) SetPartStatus(ctx context.Context, id int64, status string, size *int64, digest string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE parts SET status=$2, size=coalesce($3,size), digest=CASE WHEN $4='' THEN digest ELSE $4 END WHERE id=$1`, id, status, size, digest)
 	return err
+}
+
+// WritePart serializes allowance writes with uploads, completion and deletion for this
+// account. The writer gets the bytes available for this component, including any bytes
+// it replaces. Holding the lock through the write also bounds chunked HTTP requests.
+func (s *Store) WritePart(ctx context.Context, id int64, quota int64, write func(room int64) (int64, string, error)) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var account, backend, status string
+	var versionID, oldSize int64
+	var shared bool
+	if err := tx.QueryRowContext(ctx, `SELECT s.account_id, v.backend, v.id FROM parts p
+		JOIN versions v ON v.id=p.version_id JOIN saves s ON s.id=v.save_id WHERE p.id=$1`, id).
+		Scan(&account, &backend, &versionID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1)::bigint)`, account); err != nil {
+		return err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT v.status, coalesce(p.size,0), p.shared FROM parts p
+		JOIN versions v ON v.id=p.version_id WHERE p.id=$1 FOR UPDATE OF p, v`, id).
+		Scan(&status, &oldSize, &shared); err != nil {
+		return err
+	}
+	if status != Uploading || shared {
+		return ErrNotUploading
+	}
+	room := int64(-1)
+	if quota > 0 {
+		var used int64
+		if err := tx.QueryRowContext(ctx, `SELECT coalesce(sum(`+chargedBytes+`),0) FROM versions v
+			JOIN saves s ON s.id=v.save_id WHERE s.account_id=$1 AND v.backend=$2
+			AND v.status IN ('live','uploading')`, account, backend).Scan(&used); err != nil {
+			return err
+		}
+		room = quota - used + oldSize
+		if room < 0 {
+			return ErrQuota{Used: used, Limit: quota}
+		}
+	}
+	n, digest, err := write(room)
+	if err != nil {
+		return err
+	}
+	if room >= 0 && n > room {
+		return ErrQuota{Used: quota - room, Limit: quota, Wanted: n}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE parts SET status='uploading', size=$2, digest=$3 WHERE id=$1`, id, n, digest); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE versions SET size=(SELECT coalesce(sum(size),0) FROM parts WHERE version_id=$1)
+		WHERE id=$1 AND meta->>'quota_by_parts'='true'`, versionID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) Version(ctx context.Context, id int64) (*Version, error) {
@@ -574,10 +640,10 @@ func (s *Store) SetLocation(ctx context.Context, versionID int64, loc Location) 
 	return err
 }
 
-// Usage is the live bytes an account holds in one backend, and in total.
+// Usage includes complete backups and bytes held by uploads still in progress.
 func (s *Store) Usage(ctx context.Context, account, backend string) (inBackend, total int64, err error) {
-	err = s.db.QueryRowContext(ctx, `SELECT coalesce(sum(CASE WHEN v.backend=$2 THEN v.size ELSE 0 END),0), coalesce(sum(v.size),0)
-		FROM versions v JOIN saves s ON s.id=v.save_id WHERE s.account_id=$1 AND v.status='live'`, account, backend).Scan(&inBackend, &total)
+	err = s.db.QueryRowContext(ctx, `SELECT coalesce(sum(CASE WHEN v.backend=$2 THEN `+chargedBytes+` ELSE 0 END),0), coalesce(sum(`+chargedBytes+`),0)
+		FROM versions v JOIN saves s ON s.id=v.save_id WHERE s.account_id=$1 AND v.status IN ('live','uploading')`, account, backend).Scan(&inBackend, &total)
 	return
 }
 

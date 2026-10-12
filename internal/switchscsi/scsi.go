@@ -292,6 +292,12 @@ func (s *Server) storage(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(resourcePath(r.URL.Path), "/"), "/")
 	ctx := r.Context()
 	switch parts[0] {
+	case "permissions":
+		if r.Method != http.MethodGet {
+			nintendoErr(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed", r.Method+" is not allowed here")
+			return
+		}
+		s.backupPermissions(ctx, w, c)
 	case "network_service_accounts":
 		if !mustPost(w, r) {
 			return
@@ -310,6 +316,46 @@ func (s *Server) storage(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[scsi] UNHANDLED %s %s", r.Method, r.URL.Path)
 		nintendoErr(w, http.StatusNotFound, "resource_is_not_found", "Specified resource is not found", "Resource is not found")
 	}
+}
+
+// Native olsc:u joins these recovery grants with datatype-3 archives before offering
+// island restoration. OpenPak grants recovery to the authenticated owner on any device.
+// Archive-id routes independently enforce that same ownership for every download.
+func (s *Server) backupPermissions(ctx context.Context, w http.ResponseWriter, c caller) {
+	type permission struct {
+		ID            int64  `json:"id"`
+		ArchiveID     int64  `json:"save_data_archive_id"`
+		NSA           string `json:"nsa_id"`
+		ApplicationID string `json:"application_id"`
+		CreatedAt     int64  `json:"created_at_as_unixtime"`
+	}
+	grants := []permission{}
+	saves, err := s.Svc.Store.Saves(ctx, c.account)
+	if err != nil {
+		nintendoErr(w, 500, "internal_server_error", "Internal error", err.Error())
+		return
+	}
+	for _, sv := range saves {
+		if sv.Platform != Platform {
+			continue
+		}
+		versions, err := s.Svc.Store.Versions(ctx, sv.ID, false)
+		if err != nil {
+			nintendoErr(w, 500, "internal_server_error", "Internal error", err.Error())
+			return
+		}
+		for _, v := range versions {
+			a := s.archiveOf(&v, &sv, c, false)
+			if !isConsole(&v) || a.Datatype != 3 || a.Status != "fixed" || !complete(a) {
+				continue
+			}
+			grants = append(grants, permission{v.ID, v.ID, a.NsaID, a.ApplicationID, v.CreatedAt.Unix()})
+			// Match the current-backup list. Native OLSC bounds permission records
+			// before joining them with archives; retained history can overflow it.
+			break
+		}
+	}
+	out(w, http.StatusOK, map[string]any{"permissions": grants})
 }
 
 func (s *Server) archives(ctx context.Context, w http.ResponseWriter, r *http.Request, c caller, rest []string) {
@@ -531,6 +577,19 @@ func (s *Server) list(ctx context.Context, w http.ResponseWriter, r *http.Reques
 		seen := map[int]bool{}
 		for i := range vs {
 			a := s.archiveOf(&vs[i], sv, c, false)
+			if !isConsole(&vs[i]) {
+				continue
+			}
+			device := q.Get("device_id")
+			if device == "me" {
+				device = c.device
+				if device == "" {
+					continue
+				}
+			}
+			if device != "" && a.DeviceID != device {
+				continue
+			}
 			if dt := q.Get("datatype"); dt != "" && dt != strconv.Itoa(a.Datatype) {
 				continue
 			}
@@ -610,9 +669,10 @@ func (s *Server) startUpload(ctx context.Context, w http.ResponseWriter, r *http
 		}
 	}
 	savedAt := time.Unix(in.SavedAt, 0)
-	// The uploading version is the allowance reservation: the console's declared data_size is
-	// held until it commits or the sweep takes it back.
-	v, err := s.Svc.Store.NewVersion(ctx, sv.ID, base, c.device, loc, meta, in.DataSize, &savedAt, uploadWindow, s.Svc.Quota(loc.Backend))
+	// data_size is the expanded save image. Quota counts the compressed component bytes,
+	// under the account lock at each PUT; the expanded size remains in the wire metadata.
+	meta["quota_by_parts"] = true
+	v, err := s.Svc.Store.NewVersion(ctx, sv.ID, base, c.device, loc, meta, 0, &savedAt, uploadWindow, s.Svc.Quota(loc.Backend))
 	if err != nil {
 		var q store.ErrQuota
 		if errors.As(err, &q) {
@@ -855,7 +915,7 @@ func (s *Server) putBlob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	b, v, acct, err := s.blobBackend(r, p)
+	b, v, _, err := s.blobBackend(r, p)
 	if err != nil {
 		log.Printf("[scsi] blob put part=%d: %v", p.ID, err)
 		http.Error(w, "storage unavailable", http.StatusBadGateway)
@@ -866,33 +926,51 @@ func (s *Server) putBlob(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "archive is fixed", http.StatusConflict)
 		return
 	}
-	body, room := io.Reader(r.Body), int64(-1)
-	if v.Backend == blob.Local {
-		used, _, err := s.Svc.Store.Usage(ctx, acct, blob.Local)
-		if err != nil {
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
+	err = s.Svc.Store.WritePart(ctx, p.ID, s.Svc.Quota(v.Backend), func(room int64) (int64, string, error) {
+		body := io.Reader(r.Body)
+		if room >= 0 {
+			if r.ContentLength > room {
+				return 0, "", store.ErrQuota{Used: s.Svc.Allowance - room, Limit: s.Svc.Allowance, Wanted: r.ContentLength}
+			}
+			body = &allowanceReader{Reader: body, left: room}
 		}
-		// ponytail: a per-request cap, not a reservation across in-flight uploads; the
-		// reservation is C1's job. This is what stops one console filling the disk.
-		room = s.Svc.Allowance - used
-		body = io.LimitReader(body, room+1)
-	}
-	n, digest, err := s.Svc.PutPart(ctx, b, p, body, r.ContentLength)
+		n, digest, err := s.Svc.PutPart(ctx, b, p, body, r.ContentLength)
+		return n, "sha256:" + digest, err
+	})
 	if err != nil {
 		log.Printf("[scsi] blob put part=%d: %v", p.ID, err)
+		var q store.ErrQuota
+		if errors.As(err, &q) {
+			http.Error(w, "allowance exceeded", http.StatusForbidden)
+			return
+		}
+		if errors.Is(err, store.ErrNotUploading) {
+			http.Error(w, "archive is fixed", http.StatusConflict)
+			return
+		}
 		http.Error(w, "write failed", http.StatusInternalServerError)
 		return
 	}
-	if room >= 0 && n > room {
-		_ = b.Delete(ctx, p.Key)
-		log.Printf("[scsi] blob put part=%d: %d bytes over the %d left of the allowance", p.ID, n-room, room)
-		http.Error(w, "allowance exceeded", http.StatusForbidden)
-		return
-	}
-	// The console's own finish_upload sets the digest it computed; ours goes in meanwhile.
-	_ = s.Svc.Store.SetPartStatus(ctx, p.ID, "uploading", &n, "sha256:"+digest)
 	w.WriteHeader(http.StatusOK)
+}
+
+// Return an error before the local backend renames its temporary file. An oversized
+// chunked request must never publish a truncated blob or destroy a previous upload.
+type allowanceReader struct {
+	io.Reader
+	left int64
+}
+
+func (r *allowanceReader) Read(p []byte) (int, error) {
+	if int64(len(p)) > r.left+1 {
+		p = p[:r.left+1]
+	}
+	n, err := r.Reader.Read(p)
+	r.left -= int64(n)
+	if r.left < 0 {
+		return n, store.ErrQuota{Wanted: int64(n)}
+	}
+	return n, err
 }
 
 func (s *Server) getBlob(w http.ResponseWriter, r *http.Request) {

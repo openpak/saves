@@ -38,6 +38,14 @@ Who calls it:
 
 ## Managing the cloud
 
+ACNH island recovery uses the console API on both Harbor and a real Switch. `GET
+/scsi/api/console/v3/permissions` grants the authenticated account access to its newest
+complete island archive (`datatype=3`) per title, including an archive uploaded by another
+device. Recovery joins those grants with the archive list, then downloads metadata and
+chunks through the existing archive and signed component routes. Ownership is checked
+again on every archive and component request. `device_id=me` scopes a device's backup cache;
+recovery omits that filter. These recovery changes are local and not yet deployed.
+
 The account owner sees and deletes console backups on the website (`/account/saves`) and, later,
 in the app. The website decides who the account is and calls these internal routes
 (`X-Internal-Key`); the app reaches them through the website's authenticated API
@@ -51,9 +59,12 @@ in the app. The website decides who the account is and calls these internal rout
 
 A deleted backup leaves the console's list at once and its bytes are removed from the backend.
 The quota is `SAVES_ALLOWANCE_BYTES` per account (default 256 MiB, counted over live and
-uploading backups on the OpenPak-hosted allowance); `start_upload` answers 403
-`storage_quota_exceeded` when the declared size does not fit. The console's own "cloud full"
-error code is not known, so the console sees an HTTP 403 with that Nintendo-shaped body; a
+uploading backups on the OpenPak-hosted allowance). It counts compressed component bytes,
+not the expanded save-image `data_size`; ACNH island backups can therefore upload even when
+their expanded image exceeds the remaining allowance. Each blob PUT holds the account's
+quota lock through the write and answers 403 if the component does not fit. A retry replaces
+its component's charge, and an oversized chunked request preserves the previous blob. The
+console's own "cloud full" error code is not known; a
 player who connects their own storage is not limited by it. Which client uploaded a backup is
 read from `X-OpenPak-Client` (`harbor/...` means Harbor, anything else a Switch).
 

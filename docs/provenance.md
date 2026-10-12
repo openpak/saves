@@ -33,6 +33,29 @@ datatype. This is OpenPak's current-backup policy, based on the client bound; it
 establish Nintendo's retention policy. The website still lists every retained revision,
 and archive-id routes still serve them. No backup is deleted to meet the client bound.
 
+## ACNH island recovery (23.0.1, 2026-10-12)
+
+The owner's firmware research in
+`scratch/harbor-eden/research/olsc-re/olsc-save-data-backup.md` establishes the application
+restore contract. `olsc:u` command 25 takes a transfer-memory size and user ID, fetches
+`/permissions`, then joins grants with fixed `datatype=3` archives for the caller's title.
+Each permission requires `id`, `save_data_archive_id`, `nsa_id`, `application_id`, and
+`created_at_as_unixtime`; a missing key returns 2179-3320. The list capacity is the memory
+size divided by 0x438; public records are 0x410 bytes (archive ID, finished time, 0x400-byte
+custom description). Command 26 takes the user ID and archive ID, checks the launch
+version, registers a device-save download, and sets extra-data Restore flag 0x10 after import.
+
+OpenPak's recovery policy grants the authenticated owner access on any of their devices.
+Grants expose only the newest complete island revision per title, matching the current-backup
+list: native OLSC bounds the permission list before joining it, so advertising retained
+history could overflow the caller's transfer-memory capacity. Account ownership is checked
+independently on all archive and component routes. `device_id=me` selects the caller's
+device for the local backup cache; the recovery list intentionally omits this restriction.
+These server changes are local, not deployed. Database tests prove the HTTP policy and
+cross-account rejection; Harbor's synthetic transfer checks prove listing, stream recovery,
+version refusal, and cancellation before import. An actual ACNH restore on a real Switch
+or Android device has not been verified by these tests.
+
 ## Hostnames
 
 | Host | Role | Source |
@@ -108,7 +131,7 @@ with the segment fixed. Same resources either way, which is why the adapter take
 | `save_data_archives/%llu/delete?force=true` | **yes, since 2026-09-16** | 1468615 |
 | `component_files/%llu/signed_uri`, `/update`, `/finish_upload` | yes | 1469557, 1479976, 1462612 |
 | `application_policy/%016llx/%05u?dtoken=` | yes | 1470372 |
-| `permissions` | **no** | 1470346 |
+| `permissions` | yes (local, 2026-10-12) | 1470346 |
 | `save_data_sets`, `?update=true`, `?survey_request_id=%llu&repair_status=%s` | **no** | 1474085, 1460691, 1464913 |
 | `save_data_sets/generate_key_package` | **no** | 1456214 |
 | `customer_operations`, `?survey_request_id=%llu`, `/update_action_completed` | **no** | 1472350, 1469294, 1471465 |
@@ -125,7 +148,7 @@ Bodies and fields F formats, beyond what N showed: `{"encoded_challenge": "%s"}`
 `{"save_data_archive_id":%llu,"nsa_id":"%016llx","save_data_type":"%s"}` [1463752]. Replies are
 read by path: `$.encoded_key_seed_package` [1456375], `$.format_version`, `$.component_file`,
 `$.revision`, `$.nsa_id`. The console also logs `x-nintendo-akamai-reference-id` [1479894].
-**Unexplained:** what `permissions` answers, what `save_data_type` and `$.revision` carry, and
+**Unexplained:** what `save_data_type` and `$.revision` carry, and
 where `encoded_key_seed`/`encoded_sek` are sent — none of those are on a backup path we have
 watched.
 
@@ -280,6 +303,25 @@ token. That is the whole emulator contract Reference offers: newest wins, no ver
 conflict. Evidence for what a client will do, not a design to keep.
 
 ## Console archives only
+
+### Compressed storage quota (2026-10-12)
+
+An owned Harbor ACNH island backup (`datatype: 3`) reached `start_upload` but was refused
+with HTTP 403, `storage_quota_exceeded`, code `0000`. Its expanded save image exceeded the
+account's remaining hosted allowance, despite the island files occupying far less space.
+The expanded image size must remain in `data_size` and determine the division count; it
+does not describe the compressed files stored by this service. See Harbor's
+`docs/harbor/save-cloud-interop.md` for independent native-console evidence of this distinction.
+
+New console uploads carry an internal `quota_by_parts` marker and initially charge no bytes.
+Quota then counts component sizes for uploading versions and stored sizes for live versions.
+Each allowance PUT holds the existing account advisory lock through writing and recording
+its component, so concurrent writes cannot spend the same remaining bytes. Overwriting a
+component replaces its charge. Unknown-length bodies use a reader that fails before the
+local backend publishes its temporary file. Older uploads retain their declared reservation
+until completion or timeout. No console wire fields change. The database integration test
+`TestCompressedIslandQuota` covers an expanded island image, concurrent writes, retries,
+chunked overflow, preservation of previous bytes, exact quota exhaustion and final metadata.
 
 The cloud holds console archives and nothing else: backups made through the console upload
 protocol by a real Switch or by Harbor (which acts exactly like a real console), marked

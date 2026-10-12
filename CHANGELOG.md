@@ -3,6 +3,11 @@
 Generated from git history on 2026-09-15. `git log` stays the source
 of truth; this file is the readable summary.
 
+## v0.4.5 — 2026-10-12
+
+- ACNH recovery grants (`/permissions`) expose the current island backup within the authenticated account; device-scoped archive lists distinguish a local backup cache from cross-device recovery
+- ACNH island backups and other console archives charge compressed component bytes against quota instead of reserving the expanded save-image size; concurrent uploads, retries and chunked requests enforce the same account allowance
+
 ## v0.4.3 — 2026-10-09
 
 - a delta upload keeps the previous archive's untouched chunks: they are shared (not copied) until `finish_upload` makes them part of the new archive, so the delta lists, downloads and exports whole
