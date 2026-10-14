@@ -301,6 +301,17 @@ func (s *Service) Sweep(ctx context.Context) {
 	for _, v := range dead {
 		s.DeleteBlobs(ctx, strings.SplitN(firstKey(v), "/", 2)[0], v)
 	}
+	// Retention for saves that nobody uploads to again (Finish prunes only the save it completes).
+	over, err := s.Store.PruneOverflow(ctx, 50)
+	if err != nil {
+		log.Printf("[saves] sweep retention: %v", err)
+	}
+	for _, v := range over {
+		s.DeleteBlobs(ctx, strings.SplitN(firstKey(v), "/", 2)[0], v)
+	}
+	if len(over) > 0 {
+		log.Printf("[saves] sweep retention: pruned %d old version(s) beyond the newest %d", len(over), store.Keep)
+	}
 }
 
 func firstKey(v store.Version) string {

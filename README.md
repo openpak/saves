@@ -59,6 +59,11 @@ in the app. The website decides who the account is and calls these internal rout
 | `DELETE /internal/accounts/{account}/saves/{platform}/{title}` | delete every backup of a title, pinned too (200 `{"deleted":n}`, 404 when none) |
 
 A deleted backup leaves the console's list at once and its bytes are removed from the backend.
+Retention (alpha phase): each save keeps the newest **two** live backups of each kind (a kind is the console's
+datatype, the origin console/emulator, and whether the digest is one the console accepts), plus any pinned
+backup and any unresolved conflict. It is applied when an upload completes and by the periodic sweep for saves
+nobody uploads to again (50 saves per pass). It was ten.
+
 The quota is `SAVES_ALLOWANCE_BYTES` per account (default 1 GiB during the alpha phase, was 256 MiB; counted over live and
 uploading backups on the OpenPak-hosted allowance). It counts compressed component bytes,
 not the expanded save-image `data_size`; ACNH island backups can therefore upload even when

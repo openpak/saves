@@ -73,7 +73,9 @@ func TestIslandRecoveryPermissions(t *testing.T) {
 	two := add(owner, 3, store.Live, "console", digest)
 	add(owner, 0, store.Live, "console", digest)
 	add(owner, 3, store.Uploading, "console", digest)
-	add(owner, 3, store.Deleted, "console", digest)
+	// Retention keeps the newest two valid backups of a kind, so the deleted record must not be a
+	// third valid console island backup (it would retire `one` before it was ever deleted).
+	add(owner, 3, store.Deleted, "console", "!invalid")
 	add(owner, 3, store.Live, "emulator", digest)
 	add(owner, 3, store.Live, "console", "!invalid")
 	foreign := add(other, 3, store.Live, "console", digest)

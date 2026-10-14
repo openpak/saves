@@ -75,8 +75,9 @@ CREATE TABLE IF NOT EXISTS audit (
 );
 `
 
-// Keep is how many live versions a save retains besides the pinned ones (CS-04).
-const Keep = 10
+// Keep is how many live versions of each kind a save retains besides the pinned ones (CS-04). Alpha
+// phase: the newest two (was 10); a pinned version and an unresolved conflict are never counted or pruned.
+const Keep = 2
 
 // Statuses of a version and of a part.
 const (
@@ -519,11 +520,72 @@ func (s *Store) Finish(ctx context.Context, id int64, sha256 string) (*Version, 
 	return v, gone, nil
 }
 
-// prune is retention: everything live, unpinned and beyond the newest Keep goes. A conflict
+// PruneOverflow applies retention to saves written before Keep shrank: Finish only prunes the save
+// it just completed, so a save nobody uploads again would keep its old history forever. It handles
+// at most limit saves per call and returns the versions pushed out (their blobs are the caller's
+// to delete), like Finish does.
+func (s *Store) PruneOverflow(ctx context.Context, limit int) ([]Version, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT save_id FROM (
+			SELECT save_id FROM versions WHERE status='live' AND NOT pinned AND NOT conflict
+			GROUP BY save_id, `+retentionKind+` HAVING count(*) > $1) over ORDER BY save_id LIMIT $2`, Keep, limit)
+	if err != nil {
+		return nil, err
+	}
+	var saves []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		saves = append(saves, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	var gone []Version
+	for _, saveID := range saves {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return gone, err
+		}
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext(account_id)::bigint) FROM saves WHERE id=$1`, saveID); err != nil {
+			tx.Rollback()
+			return gone, err
+		}
+		ids, err := prune(ctx, tx, saveID)
+		if err != nil {
+			tx.Rollback()
+			return gone, err
+		}
+		if err := tx.Commit(); err != nil {
+			return gone, err
+		}
+		for _, id := range ids {
+			if g, err := s.Version(ctx, id); err == nil {
+				gone = append(gone, *g)
+			}
+		}
+	}
+	return gone, nil
+}
+
+// retentionKind partitions a save's versions for retention: the datatype the console sends (a save
+// and an island image share one save row), where the backup came from (the console or the emulator),
+// and whether its digest is one the console's record check accepts (base64url of 1..32 bytes). Newer
+// backups of one kind never push out the only usable backup of another.
+const retentionKind = `coalesce(meta->>'datatype',''), coalesce(meta->>'origin',''), (coalesce(meta->>'encoded_digest','') ~ '^[A-Za-z0-9_-]{2,43}=*$')`
+
+// prune is retention: per kind of backup (the datatype the console sends: a save and an island
+// image share one save row), everything live, unpinned and beyond the newest Keep goes. A conflict
 // is never pruned automatically — it is the one copy of progress nobody has looked at yet.
 func prune(ctx context.Context, tx *sql.Tx, saveID int64) ([]int64, error) {
 	rows, err := tx.QueryContext(ctx, `UPDATE versions SET status='deleted' WHERE id IN (
-		SELECT id FROM versions WHERE save_id=$1 AND status='live' AND NOT pinned AND NOT conflict ORDER BY number DESC OFFSET $2) RETURNING id`, saveID, Keep)
+		SELECT id FROM (
+			SELECT id, row_number() OVER (PARTITION BY `+retentionKind+` ORDER BY number DESC) AS rn
+			FROM versions WHERE save_id=$1 AND status='live' AND NOT pinned AND NOT conflict) ranked
+		WHERE rn > $2) RETURNING id`, saveID, Keep)
 	if err != nil {
 		return nil, err
 	}
