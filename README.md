@@ -59,7 +59,7 @@ in the app. The website decides who the account is and calls these internal rout
 | `DELETE /internal/accounts/{account}/saves/{platform}/{title}` | delete every backup of a title, pinned too (200 `{"deleted":n}`, 404 when none) |
 
 A deleted backup leaves the console's list at once and its bytes are removed from the backend.
-The quota is `SAVES_ALLOWANCE_BYTES` per account (default 256 MiB, counted over live and
+The quota is `SAVES_ALLOWANCE_BYTES` per account (default 1 GiB during the alpha phase, was 256 MiB; counted over live and
 uploading backups on the OpenPak-hosted allowance). It counts compressed component bytes,
 not the expanded save-image `data_size`; ACNH island backups can therefore upload even when
 their expanded image exceeds the remaining allowance. Each blob PUT holds the account's

@@ -6,7 +6,7 @@
 //	SAVES_INTERNAL_KEY     shared secret for /internal/* callers (website, adapter); required
 //	SAVES_CREDENTIAL_KEY   seals players' storage credentials at rest; required, keep it forever
 //	SAVES_LOCAL_DIR        where the allowance's bytes live (default /app/data)
-//	SAVES_ALLOWANCE_BYTES  OpenPak-hosted bytes per account (default 268435456)
+//	SAVES_ALLOWANCE_BYTES  OpenPak-hosted bytes per account (default 1073741824, 1 GiB, alpha phase)
 //	SAVES_UPLOAD_HOST      console-facing blob hosts the adapter forwards here
 //	SAVES_DOWNLOAD_HOST      (defaults: scsi-upload.lp1.scsi.srv.nintendo.net, scsi-download.lp1.scsi.srv.nintendo.net)
 //	SAVES_SWITCH_TITLES    comma-separated title ids whose Switch policy is ALL_OK; empty allows every title
@@ -56,7 +56,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("local storage: %v", err)
 	}
-	allowance, _ := strconv.ParseInt(env("SAVES_ALLOWANCE_BYTES", "268435456"), 10, 64)
+	allowance, _ := strconv.ParseInt(env("SAVES_ALLOWANCE_BYTES", "1073741824"), 10, 64)
 	// Off by default: player storage on this host's own network is an administrator's choice.
 	blob.AllowPrivateStorage = os.Getenv("SAVES_ALLOW_PRIVATE_STORAGE") != ""
 	if n, err := st.ClearRunningMoves(context.Background()); err == nil && n > 0 {
