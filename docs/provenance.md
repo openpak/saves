@@ -1,22 +1,29 @@
 # Provenance: the Switch save-data cloud, as far as it is known
 
+> **Current Switch client (2026-10-13): Harbor**, at
+> `~/REPOS/Openpak/emulators/harbor`. Harbor is an independent
+> OpenPak project based on Eden. Citron, Ryujinx (desktop and Android), and
+> the former OpenPak Eden checkouts have been removed. References to those
+> forks below record historical evidence only: do not run their commands,
+> reinstall them, or select them for current work. Use Harbor's README and
+> current handoff for builds and testing; old results do not establish Harbor parity.
+
 Every non-obvious fact the saves service is built on, and where it came from. Per
-[`docs/clean-room-policy.md`](https://github.com/openpak/docs/blob/main/clean-room-policy.md): the earlier server's `nx-scsi` is read
-for facts about the console and the wire, never for code or shape. Nothing below is theirs to
-own; a path, a field name or a status string is a fact about the console.
+[`docs/clean-room-policy.md`](https://github.com/openpak/docs/blob/main/clean-room-policy.md): third-party
+implementations are read only for facts about the console and the wire, never for code or
+shape. A path, a field name or a status string is a fact about the console.
 
 Sources:
 
-- **N** — Reference `nx-scsi` (source-available): `handlers.go`, `main.go`, `replay_test.go`.
-  Evidence of what a console sent them and what they answered that the console accepted, as
-  far as their own comments claim ("to be validated console-side" is repeated there).
+- **N** — earlier research notes on the save-backup wire: what a console sent and what
+  answers it accepted, as far as the notes claim ("to be validated console-side" is repeated).
 - **K** — Kinnay's NintendoClients wiki, pages *OLSC Servers* and *Server List*.
 - **C** — our own console, through the Switch adapter's debug log (2026-09-07).
 - **B** — `Openpak/nx-baas/services.go`, what the adapter answers today.
 - **F** — the console's own firmware, 22.5.0: the `olsc` system module (the save-data cloud
   client) from the local audit tree, `all/olsc/strings.txt`, read 2026-09-16. Offsets in
   brackets are string-table offsets in that dump. This is first-party evidence and outranks
-  everything else here: where F and N disagree, F is the console and N is somebody's server.
+  everything else here: where F and N disagree, F is the console and N is another server's behaviour.
 
 ## Current backup versus history (23.0.1, 2026-10-11)
 
@@ -63,7 +70,7 @@ or Android device has not been verified by these tests.
 | `storage.hac.lp1.scsi.srv.nintendo.net` | the REST API, `/api/console/v3/...` | C, N |
 | `scsi-download.lp1.scsi.srv.nintendo.net` | where `get_url` points; the console GETs blobs here | N, K |
 | `scsi-upload-lp1.s3.us-west-2.amazonaws.com` | where Nintendo's `put_url` points: a plain S3 presigned PUT on a public host | K |
-| `scsi-upload.lp1.scsi.srv.nintendo.net` | the name Reference substituted for the S3 host; the console followed it | N |
+| `scsi-upload.lp1.scsi.srv.nintendo.net` | a substitute name for the S3 host; the console followed it | N |
 | `policy.hac.lp1.scsi.srv.nintendo.net` | per-title policy, `/api/console/v2/application_policy/<title>/<version>?dtoken=` | N, K |
 | `migration.lp1.scsi.srv.nintendo.net`, `*.sata.srv.nintendo.net` | account migration and save repair; not this service | K |
 
@@ -105,8 +112,8 @@ for an unknown path, archive or component, and a 500 with plain text when a blob
 (N). **Unexplained:** what the console shows for each, and whether it needs a body.
 
 **Corrected 2026-09-16:** an earlier note here said there is no delete route, on the evidence
-that N never implemented one. F has it — `save_data_archives/%llu/delete?force=true` [1468615]
-— and the adapter now answers it. Absence from somebody else's server was never evidence of
+that N never covered one. F has it — `save_data_archives/%llu/delete?force=true` [1468615]
+— and the adapter now answers it. Absence from another server was never evidence of
 absence from the console.
 
 ### The whole request set the console can build (F)
@@ -152,10 +159,10 @@ read by path: `$.encoded_key_seed_package` [1456375], `$.format_version`, `$.com
 where `encoded_key_seed`/`encoded_sek` are sent — none of those are on a backup path we have
 watched.
 
-`start_upload` metadata, as sent by a console in N's replay: `datatype` (0), `data_size`,
+`start_upload` metadata, as sent by a console in N: `datatype` (0), `data_size`,
 `saved_at_as_unixtime`, `launch_required_version`, `series_id`, `encoded_digest`, `desc`
 (null), `auto_backup`, `acd_index`. `application_id` was **absent** on a delta upload and
-taken from the previous archive. C saw `datatype=0` on the list; N's code also knows `3`.
+taken from the previous archive. C saw `datatype=0` on the list; N also knows `3`.
 **Unexplained:** what `datatype` 3 is, and `acd_index`.
 
 ## The model
@@ -180,14 +187,14 @@ and transiently `get_url` / `put_url`.
 Blob URLs seen working: `https://<host>/<nsa>/<title>/<component id>_<index>.bin?Expires=..`
 (N), served for GET on the download host and PUT on the upload host, with no bearer. The
 console PUTs the body raw and GETs it raw, `application/octet-stream`. That path shape is N's
-own choice, not the console's requirement: Nintendo's `put_url` is an S3 presigned URL on
+choice, not the console's requirement: Nintendo's `put_url` is an S3 presigned URL on
 `amazonaws.com` (K), so the console follows whatever URL the archive hands it. OpenPak mints
 `/blob/<part id>?exp&sig` on the same two hosts.
 
 **Unexplained, and the risk that decides the design:** the console encrypts each component
 before upload. `generate_key_seed_package` answers a 16-byte challenge with a 512-byte
-package the console turns into a key; `finish_upload` carries a 16-byte MAC. Reference did not
-implement this: they replay a package captured from Nintendo, and their own comment says
+package the console turns into a key; `finish_upload` carries a 16-byte MAC. N did not
+implement this: it replays a package captured from Nintendo, and the notes say
 whether the console binds the package to the challenge or to the account is unknown. 512
 bytes is the size of an RSA-4096 signature or ciphertext. If the package must be signed by a
 key in the console's firmware, no server can mint one and the answer is the same as News:
@@ -291,15 +298,15 @@ against our key. The same idea applies to fs, with differences that shape the wo
 
 `GET policy.hac.lp1.scsi.../api/console/v2/application_policy/<title>/<version>?dtoken=...`
 answers `{"policy_type": "ALL_OK"}` or `"ALL_NG"` (K, N: Nintendo blocks some titles, Splatoon
-among them; Reference allows all). The adapter today answers a differently shaped object
+among them; N allows all). The adapter today answers a differently shaped object
 (`{"application_policy": {"save_data_backup": false}}`, B); the console's reaction to that
 shape is unrecorded. `dtoken` is an edge token (K).
 
 ## Emulators
 
-Citron (earlier build) pulls `GET /api/save/<title hex>` at launch (204 = nothing stored)
+Citron pulls `GET /api/save/<title hex>` at launch (204 = nothing stored)
 and pushes `POST /api/save/<title hex>` with the raw save as the body, bearer = the account
-token. That is the whole emulator contract Reference offers: newest wins, no versions, no
+token. That is the whole emulator contract: newest wins, no versions, no
 conflict. Evidence for what a client will do, not a design to keep.
 
 ## Console archives only

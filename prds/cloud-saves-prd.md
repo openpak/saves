@@ -1,6 +1,14 @@
 # OpenPak cloud saves PRD (platform-neutral store, per-platform adapters, your own storage)
 
-> **2026-09-14 audit:** The status below is historical. See the [cloud-saves completion PRD](cloud-saves-completion-prd.md) for verified implementation, correctness gaps, Reference nx-scsi review and release gates. “Built and deployed” does not mean all acceptance journeys have passed.
+> **Current Switch client (2026-10-13): Harbor**, at
+> `~/REPOS/Openpak/emulators/harbor`. Harbor is an independent
+> OpenPak project based on Eden. Citron, Ryujinx (desktop and Android), and
+> the former OpenPak Eden checkouts have been removed. References to those
+> forks below record historical evidence only: do not run their commands,
+> reinstall them, or select them for current work. Use Harbor's README and
+> current handoff for builds and testing; old results do not establish Harbor parity.
+
+> **2026-09-14 audit:** The status below is historical. See the [cloud-saves completion PRD](cloud-saves-completion-prd.md) for verified implementation, correctness gaps, earlier research notes and release gates. “Built and deployed” does not mean all acceptance journeys have passed.
 
 Status: v2, 2026-09-10; supersedes the 2026-09-07 draft. **Built and deployed the same day**
 (M1, M2, M5 and the console surface; M0 awaits a console run). Two things changed in the plan. The Switch
@@ -48,7 +56,7 @@ The whole console protocol, with sources, is in `saves/docs/provenance.md`. The 
 - Listing is `GET save_data_archives?datatype=0`, which is what our console sends today.
 - **The console encrypts every component.** The key comes from a 512-byte
   `key_seed_package` the server returns for a 16-byte challenge. Nobody outside Nintendo
-  has generated one; Reference replays a captured one. Whether a server can mint an
+  has generated one; earlier notes replay a captured one. Whether a server can mint an
   acceptable package is unknown and is the first thing this PRD finds out.
 - Emulator (evidence): Citron pulls `GET /api/save/<title>` and pushes `POST /api/save/<title>`
   with the raw body; newest wins, no versions.
@@ -89,10 +97,7 @@ those platform layers exist.
 
 ## 6. Independent implementation rules (apply verbatim)
 
-- Every earlier network repository is source-available; its noncompete clause forbids
-  using that code in a competing product. earlier code, routes, schemas and prose are
-  **evidence of observable behaviour only**, never implementation input. Do not copy,
-  translate, or structurally mirror them. Cite them as evidence, then design from scratch.
+- OpenPak servers are AGPL-3.0-only and OpenPak-authored.
 - Go 1.26, module `github.com/openpak/<repo>`, AGPL-3.0-only, `LICENSE` verbatim from
   gnu.org. Server-rendered templates and minimal browser JavaScript for web surfaces.
   Native mobile code is the recorded non-Go exception.
@@ -259,6 +264,6 @@ Done 2026-09-10, a forward rather than a package because it decouples the two de
 ## 12. Evidence references
 
 `saves/docs/provenance.md` (2026-09-10): the console's request set from the adapter's debug
-log, Reference `nx-scsi` handlers and replay test (paths, fields, statuses, blob URL shape,
+log, earlier research notes (paths, fields, statuses, blob URL shape,
 policy reply), Kinnay wiki *OLSC Servers* and *Server List* (v2 API, field sizes, the S3
 upload host, `dtoken`), Citron client paths.

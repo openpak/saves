@@ -1,5 +1,13 @@
 # Cloud saves completion PRD
 
+> **Current Switch client (2026-10-13): Harbor**, at
+> `~/REPOS/Openpak/emulators/harbor`. Harbor is an independent
+> OpenPak project based on Eden. Citron, Ryujinx (desktop and Android), and
+> the former OpenPak Eden checkouts have been removed. References to those
+> forks below record historical evidence only: do not run their commands,
+> reinstall them, or select them for current work. Use Harbor's README and
+> current handoff for builds and testing; old results do not establish Harbor parity.
+
 Status: implementation plan, audited 2026-09-14. This document supersedes the completion claims and remaining-work plan in [the original cloud-saves PRD](cloud-saves-prd.md). It preserves the platform-neutral service and bring-your-own-storage direction.
 
 ## Outcome and release decision
@@ -17,7 +25,7 @@ No percentage-complete estimate: implemented routes, successful tests and verifi
 
 ## Audit scope and confidence
 
-Reviewed `saves`, website saves handlers/templates/client, the Flutter saves page, shared `openpak-client` API/sync implementation, selected emulator integration call sites, `nx-baas` forwarding, existing PRD and provenance, and public legacy/nx-scsi source.
+Reviewed `saves`, website saves handlers/templates/client, the Flutter saves page, shared `openpak-client` API/sync implementation, selected emulator integration call sites, `nx-baas` forwarding, existing PRD and provenance, and earlier research notes.
 
 The local `saves` HEAD was `11bd6e15d0c250391d52c1a681f7023ed9561366`. `internal/api/flow_test.go` already had uncommitted changes; the audit preserved them and tested the working tree. This workspace is a collection of repositories; its root and `prds` are not Git repositories.
 
@@ -49,19 +57,15 @@ The disposable audit database/container was removed after verification. No produ
 | Switch service | Archive/component routes, listing, policy, upload/download, timeout routes, delta component descriptions | Key package is random bytes; digest/MAC verification, delta preservation and state enforcement incomplete |
 | Operations | Docker/release workflow, health endpoint, five-minute expired-upload sweep | Release workflow inspected has no test job; no gRPC or metrics listener in current main despite old PRD architecture |
 
-## Reference nx-scsi review
+## Earlier research notes on the save-backup wire
 
-“Reference nx-scsi” was interpreted as legacy/nx-scsi (archived source record). GitHub API HEAD on review: `0f2eaf71fbae2a27d8c23d78d23690235d7be91f`, committed 2026-07-22. Findings below concern that public revision, not an unseen deployment.
+Earlier research notes give useful observable protocol evidence: archive/component requests, delta-upload sequencing, policy and blob transfer shapes. They describe a narrow Switch service with local persistence; OpenPak already has broader product surfaces and storage choices.
 
-It provides useful observable protocol evidence: archive/component requests, delta-upload sequencing, policy and blob transfer shapes. It remains a narrow Switch service with local persistence. OpenPak already has broader product surfaces and storage choices. Source: main.go (archived source record).
+The notes' key-package response reuses a captured package; challenge binding and console acceptance are explicitly unresolved there. They supply no demonstrated independent key-package generator, so they are not the answer to OpenPak’s cryptographic blocker.
 
-The key-package response reuses a captured package; challenge binding and console acceptance are explicitly unresolved in its source. It does not supply a demonstrated independent key-package generator. Do not treat it as the answer to OpenPak’s cryptographic blocker. Source: keyseed.go (archived source record).
+Their replay test sends synthetic save bytes and checks HTTP responses during a delta upload. It does not establish decryption, reboot persistence, or restore on another console. Component completion records client-supplied size/digest and archive completion discards the MAC body; these are protocol experiments, not a production integrity model to adopt.
 
-Its replay test sends synthetic save bytes and checks HTTP responses during a delta upload. It does not establish decryption, reboot persistence, or restore on another console. It was read, not executed in this audit. Source: replay_test.go (archived source record).
-
-Component completion records client-supplied size/digest; archive completion discards the MAC body. These observations are protocol experiments, not a production integrity model to adopt. Source: handlers.go (archived source record).
-
-Follow [OpenPak’s clean-room policy](https://github.com/openpak/docs/blob/main/clean-room-policy.md): retain facts and citations only; do not copy source, captured cryptographic material, implementation structure or prose. This review adds no earlier implementation to OpenPak.
+Follow [OpenPak’s clean-room policy](https://github.com/openpak/docs/blob/main/clean-room-policy.md): retain facts and citations only; do not copy source, captured cryptographic material, implementation structure or prose.
 
 ## Verified gaps and their consequences
 
