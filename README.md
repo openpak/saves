@@ -57,6 +57,7 @@ in the app. The website decides who the account is and calls these internal rout
 | `GET /internal/accounts/{account}/saves` | every title's live backups: `id`, `number`, `size`, `saved_at`, `created_at`, `console` (`Harbor` or `Switch`, never a device id), `conflict`, `pinned`, `parts`; plus `usage` (`allowance_used`, `allowance`, `total`) |
 | `DELETE /internal/accounts/{account}/versions/{id}` | delete one backup (204) |
 | `DELETE /internal/accounts/{account}/saves/{platform}/{title}` | delete every backup of a title, pinned too (200 `{"deleted":n}`, 404 when none) |
+| `DELETE /internal/accounts/{account}/saves` | account erasure (the website finaliser, after the deletion grace period): every backup, the storage credential and every row (200 `{"titles","versions"}`; 503 when bytes on OpenPak storage could not be deleted, retry) |
 
 A deleted backup leaves the console's list at once and its bytes are removed from the backend.
 Retention (alpha phase): each save keeps the newest **two** live backups of each kind (a kind is the console's

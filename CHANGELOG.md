@@ -3,6 +3,13 @@
 Generated from git history on 2026-09-15. `git log` stays the source
 of truth; this file is the readable summary.
 
+## Unreleased
+
+- `DELETE /internal/accounts/{account}/saves` erases an account: every backup (pinned, retired and
+  deleted versions too), the stored storage credential, and the saves, storage and audit rows.
+  Fails with 503, index intact, while bytes on OpenPak storage survive; bytes on the player's own
+  storage are deleted when it answers. Called by the website's erasure finaliser.
+
 ## v0.4.5 — 2026-10-12
 
 - ACNH recovery grants (`/permissions`) expose the current island backup within the authenticated account; device-scoped archive lists distinguish a local backup cache from cross-device recovery
