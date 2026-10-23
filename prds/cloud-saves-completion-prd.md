@@ -65,7 +65,7 @@ The notes' key-package response reuses a captured package; challenge binding and
 
 Their replay test sends synthetic save bytes and checks HTTP responses during a delta upload. It does not establish decryption, reboot persistence, or restore on another console. Component completion records client-supplied size/digest and archive completion discards the MAC body; these are protocol experiments, not a production integrity model to adopt.
 
-Follow [OpenPak’s clean-room policy](https://github.com/openpak/docs/blob/main/clean-room-policy.md): retain facts and citations only; do not copy source, captured cryptographic material, implementation structure or prose.
+Follow [OpenPak’s clean-room policy](https://docs.openpak.org/contributors/clean-room/): retain facts and citations only; do not copy source, captured cryptographic material, implementation structure or prose.
 
 ## Verified gaps and their consequences
 

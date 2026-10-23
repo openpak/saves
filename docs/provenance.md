@@ -9,7 +9,7 @@
 > current handoff for builds and testing; old results do not establish Harbor parity.
 
 Every non-obvious fact the saves service is built on, and where it came from. Per
-[`docs/clean-room-policy.md`](https://github.com/openpak/docs/blob/main/clean-room-policy.md): third-party
+[clean-room policy](https://docs.openpak.org/contributors/clean-room/): third-party
 implementations are read only for facts about the console and the wire, never for code or
 shape. A path, a field name or a status string is a fact about the console.
 
