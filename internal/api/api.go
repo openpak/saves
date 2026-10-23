@@ -9,6 +9,7 @@
 //	POST   /internal/accounts/{account}/versions/{id}/restore
 //	DELETE /internal/accounts/{account}/versions/{id}
 //	DELETE /internal/accounts/{account}/saves/{platform}/{title}              every backup of the title (200 {"deleted":n}; 404: none)
+//	DELETE /internal/accounts/{account}/saves                                 account erasure: everything (200 {"titles","versions"}; 503: retry)
 //	GET    /internal/accounts/{account}/storage                                 settings (no secret), usage, move state
 //	PUT    /internal/accounts/{account}/storage      Config JSON (s3 | webdav)  test first, then save
 //	GET    /internal/storage/kinds                   which kinds this deployment offers
@@ -52,6 +53,7 @@ func (s *Server) Register(mux *http.ServeMux) {
 	a("POST /internal/accounts/{account}/versions/{id}/restore", s.restore)
 	a("DELETE /internal/accounts/{account}/versions/{id}", s.deleteVersion)
 	a("DELETE /internal/accounts/{account}/saves/{platform}/{title}", s.deleteTitle)
+	a("DELETE /internal/accounts/{account}/saves", s.wipeAccount)
 	a("GET /internal/accounts/{account}/storage", s.getStorage)
 	a("PUT /internal/accounts/{account}/storage", s.putStorage)
 	a("DELETE /internal/accounts/{account}/storage", s.deleteStorage)
@@ -336,6 +338,65 @@ func (s *Server) deleteTitle(w http.ResponseWriter, r *http.Request) {
 	}
 	s.Svc.Store.Audit(ctx, account, "delete_title", map[string]any{"title": sv.TitleID, "versions": len(vs)})
 	jsonOut(w, 200, map[string]any{"deleted": len(vs)})
+}
+
+// wipeAccount irrevocably erases one account: every backup of every title
+// (pinned, retired and tombstoned versions alike), the stored third-party
+// storage credential, and the account's rows here, audit included. The
+// account-erasure finaliser calls it once the deletion grace period is over,
+// never a user flow: a deletion request alone must not destroy restorable data.
+//
+// Bytes on OpenPak's own storage must go: if any of them could not be deleted
+// the call fails (503) and leaves the index in place, so a retry finds them
+// again. Bytes on the player's own storage are deleted with the stored
+// credential when that storage answers; when it does not, they are the
+// player's, and the index and credential go anyway. A repeat is a no-op 200.
+func (s *Server) wipeAccount(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	account := r.PathValue("account")
+	saves, err := s.Svc.Store.Saves(ctx, account)
+	if err != nil {
+		failWith(w, err)
+		return
+	}
+	versions, kept := 0, 0
+	for _, sv := range saves {
+		vs, err := s.Svc.Store.Versions(ctx, sv.ID, true)
+		if err != nil {
+			failWith(w, err)
+			return
+		}
+		for _, v := range vs {
+			gone, err := s.Svc.Store.MarkDeleted(ctx, v.ID)
+			if err != nil {
+				failWith(w, err)
+				return
+			}
+			s.Svc.DeleteBlobs(ctx, account, *gone)
+			versions++
+		}
+		// DeleteBlobs forgets a version only once its bytes are gone.
+		left, err := s.Svc.Store.Versions(ctx, sv.ID, true)
+		if err != nil {
+			failWith(w, err)
+			return
+		}
+		for _, v := range left {
+			if v.Backend == blob.Local {
+				kept++
+			}
+		}
+	}
+	if kept > 0 {
+		jsonErr(w, http.StatusServiceUnavailable, fmt.Sprintf("%d backups on OpenPak storage could not be deleted; retry", kept))
+		return
+	}
+	if err := s.Svc.Store.WipeAccount(ctx, account); err != nil {
+		failWith(w, err)
+		return
+	}
+	log.Printf("[saves] account %s erased: %d titles, %d versions", account, len(saves), versions)
+	jsonOut(w, 200, map[string]any{"titles": len(saves), "versions": versions})
 }
 
 // ---- storage settings ----

@@ -838,6 +838,27 @@ func (s *Store) DeleteSettings(ctx context.Context, account string) error {
 	return err
 }
 
+// WipeAccount drops every row the account has here: saves (their versions and
+// parts cascade), the storage credential and the audit trail. The caller has
+// already deleted the bytes the versions point at.
+func (s *Store) WipeAccount(ctx context.Context, account string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, q := range []string{
+		`DELETE FROM saves WHERE account_id=$1`,
+		`DELETE FROM storage_settings WHERE account_id=$1`,
+		`DELETE FROM audit WHERE account_id=$1`,
+	} {
+		if _, err := tx.ExecContext(ctx, q, account); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (s *Store) SetTestResult(ctx context.Context, account string, ok bool, msg string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE storage_settings SET last_test_at=now(), last_test_ok=$2, last_error=$3 WHERE account_id=$1`, account, ok, msg)
 	return err
