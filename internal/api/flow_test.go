@@ -626,13 +626,16 @@ func TestConsoleListOnlyConsoleArchives(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if n, err := st.RetireEmulatorSaves(ctx); err != nil || n < 3 {
+	// Keep is two: finishing the third version prunes the first, so exactly
+	// the two live non-console versions retire here (a dirtier database only
+	// adds more).
+	if n, err := st.RetireEmulatorSaves(ctx); err != nil || n < 2 {
 		t.Fatalf("retire: %d %v", n, err)
 	}
 	if n, err := st.RetireEmulatorSaves(ctx); err != nil || n != 0 {
 		t.Fatalf("retiring again must change nothing: %d %v", n, err)
 	}
-	if n, _, err := st.Retired(ctx); err != nil || n < 3 {
+	if n, _, err := st.Retired(ctx); err != nil || n < 2 {
 		t.Fatalf("retired count: %d %v", n, err)
 	}
 	if code, _ := do("PUT", "/internal/accounts/"+acct+"/saves/switch/"+title, "zip-bytes", nil); code != http.StatusGone {
