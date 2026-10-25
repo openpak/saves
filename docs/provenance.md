@@ -30,8 +30,7 @@ Sources:
 Our own firmware inspection shows that the native download lookup (`olsc` 0x1e67c0) calls
 the archive-list helper (0x1e61e0) with capacity two. Upload paths (0x210ae0, 0x212ed0) use
 the same bound. The list sink (0x1e7630 / 0x1e76e0) returns 0x1900b3 (module 179,
-description 3200) on a third record. Scratch notes are in
-`scratch/harbor-eden/research/olsc-re/olsc-transfer-work/<user-a>-cloud-download-20261011/`.
+description 3200) on a third record. Scratch notes are in private notes.
 Live Switch retries for titles with three retained revisions stopped after an HTTP 200 list,
 without requesting an archive, key-seed package or blob.
 
@@ -42,8 +41,7 @@ and archive-id routes still serve them. No backup is deleted to meet the client 
 
 ## ACNH island recovery (23.0.1, 2026-10-12)
 
-The owner's firmware research in
-`scratch/harbor-eden/research/olsc-re/olsc-save-data-backup.md` establishes the application
+The owner's firmware research in private notes establishes the application
 restore contract. `olsc:u` command 25 takes a transfer-memory size and user ID, fetches
 `/permissions`, then joins grants with fixed `datatype=3` archives for the caller's title.
 Each permission requires `id`, `save_data_archive_id`, `nsa_id`, `application_id`, and
@@ -351,7 +349,7 @@ data, so any value works), and a delta upload repeats its previous archive's cou
 console requires (else 2179-0301). The count is stored with the archive.
 
 `generate_key_seed_package` builds the 512-byte KeySeedPackageV0 that the 23.0.1 fs
-accepts through `SetKeySeedPackage` (Harbor `research/olsc-re/fs-transfer.md` §9.2):
+accepts through `SetKeySeedPackage` (Harbor private notes, §9.2):
 
 | Offset | Field |
 | --- | --- |
