@@ -17,7 +17,7 @@ import (
 )
 
 // A KeySeedPackageV0 is what a console's fs accepts through SetKeySeedPackage before it
-// downloads an archive or uploads a delta (docs/provenance.md, "Key seed package"; Harbor's
+// downloads an archive or uploads a delta (docs/protocol.md, "Key seed package"; Harbor's
 // research/olsc-re/fs-transfer.md §9.2). 512 bytes:
 //
 //	+0x000 u32 Version (0, must be < 0x100)   +0x008 u8 KeyGeneration

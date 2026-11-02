@@ -306,7 +306,7 @@ func TestFlow(t *testing.T) {
 
 	// A fixed archive stays fixed: the upload URL still verifies but the bytes are closed,
 	// a retried finish is a no-op, and the action routes are POST-only. The v2 prefix is the
-	// same resource as v3 (docs/provenance.md).
+	// same resource as v3 (docs/protocol.md).
 	if resp := do("PUT", "/scsi"+pu.Path+"?"+pu.RawQuery, bytes.NewReader([]byte("overwrite!!")), nil); resp.StatusCode != 409 {
 		t.Fatalf("a fixed archive's bytes must not be rewritable, got %d", resp.StatusCode)
 	}

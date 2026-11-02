@@ -5,7 +5,7 @@
 // when it has not. The blob hosts carry no bearer at all: their URLs are the credential.
 //
 // The request set, field names and statuses are recorded with their sources in
-// docs/provenance.md. This is OpenPak's implementation of that set over the index and the
+// docs/protocol.md. This is OpenPak's implementation of that set over the index and the
 // bytes; a console backup is one version, its component files are that version's parts.
 package switchscsi
 
@@ -50,7 +50,7 @@ type Server struct {
 func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/scsi/api/console/v3/", s.storage)
 	// Older firmware calls /api/nx/v2 (K); nx-scsi answers v2 as well as v3. Same resources,
-	// so one dispatcher takes every prefix (docs/provenance.md).
+	// so one dispatcher takes every prefix (docs/protocol.md).
 	mux.HandleFunc("/scsi/api/console/v2/", s.storage)
 	mux.HandleFunc("/scsi/api/nx/v2/", s.storage)
 	mux.HandleFunc("GET /scsi/api/console/v2/application_policy/{title}/{version}", s.policy)
@@ -554,7 +554,7 @@ func (s *Server) list(ctx context.Context, w http.ResponseWriter, r *http.Reques
 		nintendoErr(w, http.StatusInternalServerError, "internal_server_error", "Internal error", err.Error())
 		return
 	}
-	// listed hides component_files: the list carries none (docs/provenance.md, C and N).
+	// listed hides component_files: the list carries none (docs/protocol.md, C and N).
 	type listed struct {
 		*archive
 		ComponentFiles *int `json:"component_files,omitempty"`
@@ -571,7 +571,7 @@ func (s *Server) list(ctx context.Context, w http.ResponseWriter, r *http.Reques
 			return
 		}
 		// This is the current cloud backup, not revision history. The native upload and
-		// download paths have room for only two records per title (23.0.1 olsc; provenance).
+		// download paths have room for only two records per title (23.0.1 olsc; docs/protocol.md).
 		// Versions is newest first; keep the newest complete archive of each datatype.
 		// History remains available through the internal API and archive-id routes.
 		seen := map[int]bool{}
