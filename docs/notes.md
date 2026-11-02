@@ -6,7 +6,7 @@ the player's own S3-compatible storage for everything beyond it. The plan is
 [`../prds/cloud-saves-prd.md`](../prds/cloud-saves-prd.md); what is known about the console's
 protocol, and from where, is [`provenance.md`](provenance.md).
 
-**Status (2026-10-08): built and deployed.** The cloud holds console archives only: the emulator
+The cloud holds console archives only: the emulator
 save API is retired (410 Gone) since v0.4.0. The Switch surface is served and answers the console's request set; `generate_key_seed_package` builds the real, signed KeySeedPackageV0 when
 `SAVES_KSP_SIGNING_KEY_FILE` and `SAVES_KSP_PACKAGE_KEY_FILE` name key files (see
 `docs/provenance.md`); without them it answers 503.
