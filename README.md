@@ -30,10 +30,9 @@ go run ./cmd/saves
 ## Docs
 
 - [Protocol](docs/protocol.md)
-- [Evidence](docs/evidence.md)
 - [Deploy](docs/deploy.md)
-- [Notes](docs/notes.md)
-- [Provenance](docs/provenance.md)
+
+PRDs: openpak/prds (private)
 
 ## Licence
 
