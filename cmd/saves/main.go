@@ -68,6 +68,7 @@ func main() {
 	} else if n > 0 {
 		log.Printf("saves: retired %d emulator save version(s); hidden, not deleted", n)
 	}
+	blobMax, _ := strconv.ParseInt(env("SAVES_BLOB_MAX_BYTES", "2147483648"), 10, 64)
 	credKey := required("SAVES_CREDENTIAL_KEY")
 	if len(credKey) < 32 {
 		log.Fatal("SAVES_CREDENTIAL_KEY must be at least 32 bytes")
@@ -80,8 +81,10 @@ func main() {
 			GoogleClientID: os.Getenv("SAVES_GOOGLE_CLIENT_ID"), GoogleClientSecret: os.Getenv("SAVES_GOOGLE_CLIENT_SECRET"),
 			MicrosoftClientID: os.Getenv("SAVES_MICROSOFT_CLIENT_ID"), MicrosoftClientSecret: os.Getenv("SAVES_MICROSOFT_CLIENT_SECRET"),
 		},
-		UploadHost:   env("SAVES_UPLOAD_HOST", "scsi-upload.lp1.scsi.srv.nintendo.net"),
-		DownloadHost: env("SAVES_DOWNLOAD_HOST", "scsi-download.lp1.scsi.srv.nintendo.net"),
+		BlobRetention: blobRetention(env("SAVES_BLOB_KEEP", "default=1")),
+		BlobMax:       blobMax,
+		UploadHost:    env("SAVES_UPLOAD_HOST", "scsi-upload.lp1.scsi.srv.nintendo.net"),
+		DownloadHost:  env("SAVES_DOWNLOAD_HOST", "scsi-download.lp1.scsi.srv.nintendo.net"),
 	}
 
 	// `app purge-retired` deletes what the retired emulator API stored, once the owner said so.
@@ -141,4 +144,16 @@ func loadKSP() *switchscsi.KSP {
 	}
 	log.Printf("saves: key seed packages on (key generation %d)", gen)
 	return k
+}
+
+// blobRetention parses SAVES_BLOB_KEEP, "ps3=1,psp=2,default=1": versions kept per neutral blob.
+func blobRetention(spec string) map[string]int {
+	out := map[string]int{}
+	for _, kv := range strings.Split(spec, ",") {
+		k, v, ok := strings.Cut(strings.TrimSpace(kv), "=")
+		if n, err := strconv.Atoi(v); ok && err == nil && n > 0 {
+			out[strings.ToLower(k)] = n
+		}
+	}
+	return out
 }

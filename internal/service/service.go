@@ -31,6 +31,9 @@ type Service struct {
 	// UploadHost and DownloadHost are the console-facing names the signed blob URLs carry;
 	// the adapter forwards both here.
 	UploadHost, DownloadHost string
+	// BlobRetention is how many versions of a neutral blob each platform keeps ("default" for the rest).
+	BlobRetention map[string]int
+	BlobMax       int64 // largest neutral blob (icon + data) accepted, 0 = no limit
 }
 
 // BackendFor is where an account writes new versions: its own storage when it has connected

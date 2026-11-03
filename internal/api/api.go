@@ -10,6 +10,7 @@
 //	DELETE /internal/accounts/{account}/versions/{id}
 //	DELETE /internal/accounts/{account}/saves/{platform}/{title}              every backup of the title (200 {"deleted":n}; 404: none)
 //	DELETE /internal/accounts/{account}/saves                                 account erasure: everything (200 {"titles","versions"}; 503: retry)
+//	...blobs/...  neutral blobs for adapters (PS3 Online Storage): see blobs.go and docs/protocol.md
 //	GET    /internal/accounts/{account}/storage                                 settings (no secret), usage, move state
 //	PUT    /internal/accounts/{account}/storage      Config JSON (s3 | webdav)  test first, then save
 //	GET    /internal/storage/kinds                   which kinds this deployment offers
@@ -61,6 +62,7 @@ func (s *Server) Register(mux *http.ServeMux) {
 	a("GET /internal/storage/kinds", s.kinds)
 	a("GET /internal/storage/oauth/{provider}/url", s.oauthURL)
 	a("POST /internal/accounts/{account}/storage/oauth", s.oauthConnect)
+	s.registerBlobs(a)
 }
 
 func (s *Server) auth(h http.HandlerFunc) http.HandlerFunc {
@@ -125,6 +127,11 @@ func versionJSON(v store.Version) VersionJSON {
 // ConsoleLabel names the console a backup came from for a person: Harbor when the uploading
 // client said so, otherwise Switch. Device ids and serials are never shown.
 func ConsoleLabel(meta map[string]any) string {
+	if o, _ := meta["origin"].(string); o == store.BlobOrigin {
+		if l, _ := meta["label"].(string); l != "" {
+			return l
+		}
+	}
 	if c, _ := meta["client"].(string); c == "harbor" {
 		return "Harbor"
 	}
@@ -581,3 +588,5 @@ func (s *Server) move(w http.ResponseWriter, r *http.Request) {
 	go s.Svc.Move(account, toAllowance)
 	jsonOut(w, http.StatusAccepted, map[string]any{"move_state": "moving"})
 }
+
+func copyBody(w http.ResponseWriter, r io.Reader) { _, _ = io.Copy(w, r) }

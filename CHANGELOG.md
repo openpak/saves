@@ -10,6 +10,14 @@ of truth; this file is the readable summary.
   Fails with 503, index intact, while bytes on OpenPak storage survive; bytes on the player's own
   storage are deleted when it answers. Called by the website's erasure finaliser.
 
+## v0.5.0 — 2026-11-03
+
+- neutral blob routes for networks that are not the Switch (first user: PS3 Online Storage via `np-ubs`): `PUT|GET|DELETE /internal/accounts/{account}/blobs/{platform}/{title}/{name}`, a paged list with totals and a folder `seq`, `GET .../usage`, and `GET /internal/blobs/icons/{icon_id}`. See docs/protocol.md "Neutral blobs". The `/scsi` routes are unchanged.
+- blobs are ordinary saves and versions (`title_id` is `<title>:<name>`, `meta` carries the caller's JSON, icon id and md5), so they count against the same per-account allowance as Switch backups, honour the player's own S3/WebDAV storage, are erased with the account, and appear in `GET .../saves` and the website listing labelled with their console (`PS3`)
+- per-platform retention for blobs: `SAVES_BLOB_KEEP` (`ps3=1,default=1`); the Switch retention (newest two) and the emulator retirement skip blobs
+- `SAVES_BLOB_MAX_BYTES` caps one upload (icon + data), default 2 GiB; bodies are streamed to the backend and never held in memory
+- new table `blob_seq` and an index on the icon id (created at start, nothing to run)
+
 ## v0.4.5 — 2026-10-12
 
 - ACNH recovery grants (`/permissions`) expose the current island backup within the authenticated account; device-scoped archive lists distinguish a local backup cache from cross-device recovery

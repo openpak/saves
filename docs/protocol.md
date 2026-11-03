@@ -339,3 +339,34 @@ and the website's export return every chunk. Retention is safe without materiali
 a blob is deleted only when no live or uploading version still points at its key, so P can be
 pruned or deleted while a delta needs its unchanged chunks, and the last version to hold a key
 removes the blob. The division count of a delta is P's (else the console fails 2179-0301).
+
+
+## Neutral blobs (adapters for networks with their own save wire format)
+
+For a network whose console talks a save protocol of its own (PS3 Online Storage), the adapter keeps
+its wire format and maps it onto these routes. All need `X-Internal-Key`; the caller proves the
+account. Addressing is `(account, platform, title, name)`: `platform` `^[a-z0-9_-]{1,16}$` (`ps3`),
+`title` `^[0-9A-Za-z_-]{1,32}$` (the folder type `ps3|ps1|ps2|psp|minis`), `name` `^[0-9A-Za-z_.-]{1,64}$`
+(the save directory).
+
+| Route | What |
+| --- | --- |
+| `PUT .../blobs/{platform}/{title}/{name}` | Streamed upload. Body is the icon bytes (if any) then the data bytes; `Content-Length` is their sum and required. Headers: `X-Icon-Length` (0 or absent: no icon, max 4 MiB), `X-Data-Md5` and `X-Icon-Md5` (optional hex, checked), `X-Label` (what people see as the console, default the upper-cased platform), `X-Meta` (base64 of a JSON object, max 4 KiB: opaque to saves, returned as `meta`). Replaces the live blob of that name only when the new bytes arrived whole and match. 200 with the info JSON; 413 over `SAVES_BLOB_MAX_BYTES`; 422 md5 mismatch or short body; 507 `quota_exceeded` |
+| `GET .../blobs/{platform}/{title}/{name}` | The data bytes, streamed. `X-Blob-Info` is base64 of the info JSON. 404 when absent |
+| `GET .../blobs/{platform}/{title}/{name}/info` | The info JSON alone |
+| `DELETE .../blobs/{platform}/{title}/{name}` | Delete (200 `{"deleted":true,"seq"}`, 404 when absent) |
+| `GET .../blobs/{platform}/{title}?offset=&limit=` | The title's blobs ordered by name (limit max 200) with `total`, `total_size`, `seq`, `platform_count` (the account's blobs on that platform, all titles) and `usage` |
+| `GET /internal/accounts/{account}/usage` | `allowance_used`, `allowance`, `total` across every platform |
+| `GET /internal/blobs/icons/{icon_id}` | An icon by its 128-bit capability id (the info JSON's `icon_id`); the adapter serves it to the console |
+
+Info JSON: `name`, `title`, `version`, `size` (data bytes), `icon_size`, `icon_id`, `md5`, `date`
+(when it became live), `meta`, `seq`. `seq` is the folder revision of `(account, platform, title)`: it
+rises on every put and delete.
+
+Stored as: a save row with `title_id = "<title>:<name>"` (a Switch title id never has a colon), one live
+version whose `meta` is `{"origin":"blob","label","user","icon_id","data_md5",...}` and parts `data`
+(idx 0) and `icon` (idx 1). So a blob counts against the same per-account allowance as a Switch backup
+(one allowance across networks), lives on the player's own storage when they connected some, and is
+erased with the account. Retention is per platform (`SAVES_BLOB_KEEP=ps3=1,default=1`): older
+versions beyond that are deleted after a successful put. The Switch retention and the emulator
+retirement never touch blobs. The website's `GET .../saves` lists them with `console` set to the label.

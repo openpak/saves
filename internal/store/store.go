@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS parts (
 );
 ALTER TABLE parts ADD COLUMN IF NOT EXISTS shared boolean NOT NULL DEFAULT false;
 CREATE INDEX IF NOT EXISTS parts_version ON parts(version_id);
+` + blobSchema + `
+
 CREATE TABLE IF NOT EXISTS storage_settings (
 	account_id   text PRIMARY KEY,
 	kind         text NOT NULL,
@@ -526,7 +528,7 @@ func (s *Store) Finish(ctx context.Context, id int64, sha256 string) (*Version, 
 // to delete), like Finish does.
 func (s *Store) PruneOverflow(ctx context.Context, limit int) ([]Version, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT save_id FROM (
-			SELECT save_id FROM versions WHERE status='live' AND NOT pinned AND NOT conflict
+			SELECT save_id FROM versions WHERE status='live' AND NOT pinned AND NOT conflict AND `+notBlob+`
 			GROUP BY save_id, `+retentionKind+` HAVING count(*) > $1) over ORDER BY save_id LIMIT $2`, Keep, limit)
 	if err != nil {
 		return nil, err
@@ -584,7 +586,7 @@ func prune(ctx context.Context, tx *sql.Tx, saveID int64) ([]int64, error) {
 	rows, err := tx.QueryContext(ctx, `UPDATE versions SET status='deleted' WHERE id IN (
 		SELECT id FROM (
 			SELECT id, row_number() OVER (PARTITION BY `+retentionKind+` ORDER BY number DESC) AS rn
-			FROM versions WHERE save_id=$1 AND status='live' AND NOT pinned AND NOT conflict) ranked
+			FROM versions WHERE save_id=$1 AND status='live' AND NOT pinned AND NOT conflict AND `+notBlob+`) ranked
 		WHERE rn > $2) RETURNING id`, saveID, Keep)
 	if err != nil {
 		return nil, err
@@ -894,7 +896,7 @@ func (s *Store) Audit(ctx context.Context, account, action string, detail map[st
 // It is idempotent and safe to run on every start.
 func (s *Store) RetireEmulatorSaves(ctx context.Context) (int64, error) {
 	res, err := s.db.ExecContext(ctx, `UPDATE versions SET status='retired', pinned=false
-		WHERE status='live' AND coalesce(meta->>'origin','')<>'console'`)
+		WHERE status='live' AND coalesce(meta->>'origin','') NOT IN ('console','blob')`)
 	if err != nil {
 		return 0, err
 	}
