@@ -3,6 +3,10 @@
 Generated from git history on 2026-09-15. `git log` stays the source
 of truth; this file is the readable summary.
 
+## v0.6.1 — 2026-11-03
+
+- v0.6.0 did not build (its `main.go` referenced the request logger package, committed only now); same content as v0.6.0 plus `internal/httplog`: one log line per request (method, path, status, duration; never query, headers or bodies)
+
 ## v0.6.0 — 2026-11-03
 
 - the OpenPak-hosted allowance now stores its bytes in Postgres (tables `blob_objects` and `blob_chunks`, 4 MiB chunk rows, streamed both ways, a pool of 3 connections of its own), so one database backup covers the saves too. Created at start, nothing to run
