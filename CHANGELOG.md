@@ -3,6 +3,12 @@
 Generated from git history on 2026-09-15. `git log` stays the source
 of truth; this file is the readable summary.
 
+## v0.6.0 — 2026-11-03
+
+- the OpenPak-hosted allowance now stores its bytes in Postgres (tables `blob_objects` and `blob_chunks`, 4 MiB chunk rows, streamed both ways, a pool of 3 connections of its own), so one database backup covers the saves too. Created at start, nothing to run
+- at start, every file under `SAVES_LOCAL_DIR` is imported once: each copy is read back and checked by size and sha256, a part already stored identically is skipped (restarts change nothing), a part the database holds with other content is kept as the newer one, and the files are never modified or deleted. A failed verification stops the service. The log line gives found / copied / already-there counts
+- the player's own S3, WebDAV, Google Drive and OneDrive backends are unchanged
+
 ## Unreleased
 
 - `DELETE /internal/accounts/{account}/saves` erases an account: every backup (pinned, retired and

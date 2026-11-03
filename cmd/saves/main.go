@@ -5,7 +5,7 @@
 //	SAVES_DATABASE_URL     Postgres (required)
 //	SAVES_INTERNAL_KEY     shared secret for /internal/* callers (website, adapter); required
 //	SAVES_CREDENTIAL_KEY   seals players' storage credentials at rest; required, keep it forever
-//	SAVES_LOCAL_DIR        where the allowance's bytes live (default /app/data)
+//	SAVES_LOCAL_DIR        legacy file directory, imported into Postgres at start and kept (default /app/data)
 //	SAVES_ALLOWANCE_BYTES  OpenPak-hosted bytes per account (default 1073741824, 1 GiB, alpha phase)
 //	SAVES_UPLOAD_HOST      console-facing blob hosts the adapter forwards here
 //	SAVES_DOWNLOAD_HOST      (defaults: scsi-upload.lp1.scsi.srv.nintendo.net, scsi-download.lp1.scsi.srv.nintendo.net)
@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log"
 	"net/http"
@@ -24,11 +25,14 @@ import (
 	"strings"
 	"time"
 
+	_ "github.com/lib/pq"
+
 	"openpak/saves/internal/api"
 	"openpak/saves/internal/blob"
 	"openpak/saves/internal/service"
 	"openpak/saves/internal/store"
 	"openpak/saves/internal/switchscsi"
+	"openpak/saves/internal/httplog"
 )
 
 func env(k, d string) string {
@@ -52,10 +56,25 @@ func main() {
 		log.Fatalf("postgres: %v", err)
 	}
 	defer st.Close()
-	local, err := blob.NewLocal(env("SAVES_LOCAL_DIR", "/app/data"))
+	// The allowance's bytes live in Postgres, on a small pool of their own (an upload holds a
+	// connection while it streams). SAVES_LOCAL_DIR is only read: files left there by older
+	// versions are imported once, verified, and kept.
+	bdb, err := sql.Open("postgres", required("SAVES_DATABASE_URL"))
 	if err != nil {
-		log.Fatalf("local storage: %v", err)
+		log.Fatalf("postgres (blobs): %v", err)
 	}
+	bdb.SetMaxOpenConns(3)
+	bdb.SetMaxIdleConns(1)
+	local, err := blob.NewPG(bdb)
+	if err != nil {
+		log.Fatalf("blob storage (postgres): %v", err)
+	}
+	res, err := blob.ImportDir(context.Background(), local, env("SAVES_LOCAL_DIR", "/app/data"))
+	if err != nil {
+		log.Fatalf("blob import from %s: %v", env("SAVES_LOCAL_DIR", "/app/data"), err)
+	}
+	log.Printf("saves: blob storage is Postgres (%d objects, %d bytes); import from %s: %d files / %d bytes found, %d copied, %d already there, %d differ (database kept); files left in place",
+		res.DBFiles, res.DBBytes, env("SAVES_LOCAL_DIR", "/app/data"), res.Files, res.Bytes, res.Imported, res.Skipped, res.Differs)
 	allowance, _ := strconv.ParseInt(env("SAVES_ALLOWANCE_BYTES", "1073741824"), 10, 64)
 	// Off by default: player storage on this host's own network is an administrator's choice.
 	blob.AllowPrivateStorage = os.Getenv("SAVES_ALLOW_PRIVATE_STORAGE") != ""
@@ -120,7 +139,7 @@ func main() {
 
 	addr := env("SAVES_HTTP_ADDR", ":20020")
 	log.Printf("saves listening on %s (allowance %d bytes, local %s)", addr, allowance, env("SAVES_LOCAL_DIR", "/app/data"))
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Addr: addr, Handler: httplog.Middleware(mux), ReadHeaderTimeout: 10 * time.Second}
 	log.Fatal(srv.ListenAndServe())
 }
 
