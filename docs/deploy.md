@@ -24,5 +24,5 @@ Tag `v*`; the workflow publishes `ghcr.io/openpak/saves` and the host's quadlet
 needs `SAVES_DATABASE_URL`, `SAVES_INTERNAL_KEY` and `SAVES_CREDENTIAL_KEY` in the shared
 `.env`; the website and adapter need `SAVES_URL` and the same `SAVES_INTERNAL_KEY`.
 
-`SAVES_CREDENTIAL_KEY` seals every player's bucket credentials. Losing it disconnects them all;
+`SAVES_CREDENTIAL_KEY` seals every player's bucket credentials. To change it, stop the service and run `app rekey` once with `SAVES_CREDENTIAL_KEY_OLD` set to the previous key (re-seals every row, verifies each opens under the new key), then start the service on the new key. Losing it without that disconnects them all;
 rotating it means every player re-enters their secret. Back it up with the database.

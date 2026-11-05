@@ -815,6 +815,24 @@ func (s *Store) Settings(ctx context.Context, account string) (*Settings, error)
 	return st, err
 }
 
+// AllSettings lists every account's sealed settings (used by the key change).
+func (s *Store) AllSettings(ctx context.Context) ([]Settings, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT account_id, kind, config FROM storage_settings ORDER BY account_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Settings
+	for rows.Next() {
+		var st Settings
+		if err := rows.Scan(&st.AccountID, &st.Kind, &st.Config); err != nil {
+			return nil, err
+		}
+		out = append(out, st)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) PutSettings(ctx context.Context, account, kind string, config []byte) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO storage_settings (account_id, kind, config) VALUES ($1,$2,$3)
 		ON CONFLICT (account_id) DO UPDATE SET kind=$2, config=$3, last_test_at=NULL, last_test_ok=NULL, last_error='', move_state='', updated_at=now()`, account, kind, config)

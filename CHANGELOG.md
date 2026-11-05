@@ -3,6 +3,10 @@
 Generated from git history on 2026-09-15. `git log` stays the source
 of truth; this file is the readable summary.
 
+## v0.6.2 — 2026-11-05
+
+- `app rekey`: re-seals every stored storage setting from `SAVES_CREDENTIAL_KEY_OLD` to `SAVES_CREDENTIAL_KEY`, one row at a time (compare-and-swap, read back and opened under the new key); repeatable, prints counts only. Run with the service stopped, then start it on the new key
+
 ## v0.6.1 — 2026-11-03
 
 - v0.6.0 did not build (its `main.go` referenced the request logger package, committed only now); same content as v0.6.0 plus `internal/httplog`: one log line per request (method, path, status, duration; never query, headers or bodies)

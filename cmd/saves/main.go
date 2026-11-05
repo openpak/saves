@@ -4,7 +4,8 @@
 //	SAVES_HTTP_ADDR        listener (default :20020, ports.md)
 //	SAVES_DATABASE_URL     Postgres (required)
 //	SAVES_INTERNAL_KEY     shared secret for /internal/* callers (website, adapter); required
-//	SAVES_CREDENTIAL_KEY   seals players' storage credentials at rest; required, keep it forever
+//	SAVES_CREDENTIAL_KEY   seals players' storage credentials at rest; required. Change it only with
+//	                       `app rekey` (SAVES_CREDENTIAL_KEY_OLD = the previous key), service stopped
 //	SAVES_LOCAL_DIR        legacy file directory, imported into Postgres at start and kept (default /app/data)
 //	SAVES_ALLOWANCE_BYTES  OpenPak-hosted bytes per account (default 1073741824, 1 GiB, alpha phase)
 //	SAVES_UPLOAD_HOST      console-facing blob hosts the adapter forwards here
@@ -29,10 +30,10 @@ import (
 
 	"openpak/saves/internal/api"
 	"openpak/saves/internal/blob"
+	"openpak/saves/internal/httplog"
 	"openpak/saves/internal/service"
 	"openpak/saves/internal/store"
 	"openpak/saves/internal/switchscsi"
-	"openpak/saves/internal/httplog"
 )
 
 func env(k, d string) string {
@@ -104,6 +105,21 @@ func main() {
 		BlobMax:       blobMax,
 		UploadHost:    env("SAVES_UPLOAD_HOST", "scsi-upload.lp1.scsi.srv.nintendo.net"),
 		DownloadHost:  env("SAVES_DOWNLOAD_HOST", "scsi-download.lp1.scsi.srv.nintendo.net"),
+	}
+
+	// `app rekey` re-seals every stored storage setting from SAVES_CREDENTIAL_KEY_OLD to
+	// SAVES_CREDENTIAL_KEY. Run it with the service stopped, then start the service on the new key.
+	if len(os.Args) > 1 && os.Args[1] == "rekey" {
+		oldKey := os.Getenv("SAVES_CREDENTIAL_KEY_OLD")
+		if len(oldKey) < 32 {
+			log.Fatal("rekey: SAVES_CREDENTIAL_KEY_OLD must be set (at least 32 bytes)")
+		}
+		res, err := service.Rekey(context.Background(), st, []byte(oldKey), []byte(credKey))
+		fmt.Printf("rekey: %d row(s), %d re-sealed, %d already on the new key, %d unreadable; err=%v\n", res.Total, res.Rekeyed, res.AlreadyNew, len(res.Failed), err)
+		if err != nil {
+			os.Exit(1)
+		}
+		return
 	}
 
 	// `app purge-retired` deletes what the retired emulator API stored, once the owner said so.
